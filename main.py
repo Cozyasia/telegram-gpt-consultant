@@ -1,33 +1,53 @@
 import os
-import openai
+from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import openai
+import logging
 
-# Получаем ключи
+# Включаем логирование
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# Загружаем переменные
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 openai.api_key = OPENAI_API_KEY
 
+# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Здравствуйте! Я помогу вам подобрать недвижимость. Напишите, что именно вы ищете.")
+    await update.message.reply_text("Здравствуйте! Я виртуальный консультант. Задайте мне вопрос.")
 
+# Обработка всех сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+    user_message = update.message.text
+    chat_id = update.message.chat_id
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "Ты — онлайн-консультант по недвижимости, вежливо выявляющий потребности клиента."},
-            {"role": "user", "content": user_text}
-        ]
-    )
+    # GPT-запрос
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Ты — профессиональный агент по недвижимости на Самуи. Помогай клиенту, выявляй его потребности, общайся дружелюбно и конкретно."},
+                {"role": "user", "content": user_message}
+            ]
+        )
+        answer = response['choices'][0]['message']['content']
+        await update.message.reply_text(answer)
+    except Exception as e:
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
+        logging.error(f"Ошибка OpenAI: {e}")
 
-    reply = response.choices[0].message["content"]
-    await update.message.reply_text(reply)
+# Запуск бота
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logging.info("Бот запущен.")
+    application.run_polling()
 
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    main()
