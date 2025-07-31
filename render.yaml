@@ -12,3 +12,5 @@ services:
         value: ${OPENAI_API_KEY}
       - key: SYSTEM_MESSAGE
         value: "Ты — умный, дружелюбный Telegram-консультант. Помогаешь пользователю, выявляешь его запрос и отвечаешь максимально понятно."
+environment:
+pythonVersion: 3.10.13
