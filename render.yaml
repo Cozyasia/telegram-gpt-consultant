@@ -1,1 +1,14 @@
-
+services:
+  - type: worker
+    name: telegram-gpt-consultant
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        value: ${TELEGRAM_TOKEN}
+      - key: OPENAI_API_KEY
+        value: ${OPENAI_API_KEY}
+      - key: SYSTEM_MESSAGE
+        value: "Ты — умный, дружелюбный Telegram-консультант. Помогаешь пользователю, выявляешь его запрос и отвечаешь максимально понятно."
