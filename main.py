@@ -1,41 +1,45 @@
-import logging
 import os
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 import openai
-from dotenv import load_dotenv
 
-load_dotenv()
+# Установка ключей
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# Получаем токены из переменных окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
+# Обработчик /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Напиши мне что-нибудь, и я отвечу с помощью GPT.")
+    await update.message.reply_text("Привет! Я GPT-консультант. Задай свой вопрос.")
 
-async def gpt_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработчик входящих сообщений
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
-    try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": user_message}]
-        )
-        response = completion.choices[0].message.content
-        await update.message.reply_text(response)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
 
-if __name__ == '__main__':
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Ты помощник в Telegram, отвечай ясно и дружелюбно."},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.7
+        )
+
+        reply = response.choices[0].message.content.strip()
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
+        print(f"OpenAI error: {e}")
+
+# Запуск приложения
+if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ask", gpt_response))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    print("Бот запущен.")
     app.run_polling()
