@@ -1,24 +1,28 @@
+import logging
 import os
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
+
+# Включаем логирование
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я GPT-консультант. Задай мне любой вопрос!")
+    await update.message.reply_text("Привет! Я GPT-консультант. Задай мне любой вопрос.")
 
-# Обработка всех текстовых сообщений
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = update.message.text
-    # Здесь можно добавить подключение к GPT-4, сейчас простой ответ
-    await update.message.reply_text(f"Вы сказали: {user_message}")
-
-# Основной запуск бота
+# Основной запуск
 if __name__ == '__main__':
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # Убедись, что переменная окружения установлена
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    TOKEN = os.getenv("TELEGRAM_TOKEN")
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("start", start))
 
     print("Бот запущен...")
-    application.run_polling()
+    app.run_polling()
