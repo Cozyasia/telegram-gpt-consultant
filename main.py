@@ -1,4 +1,22 @@
-import os
+def preflight_close():
+    base = f"https://api.telegram.org/bot{TOKEN}"
+    try:
+        requests.post(f"{base}/deleteWebhook", json={"drop_pending_updates": True}, timeout=10)
+    except Exception:
+        pass
+    # Пытаемся освободить слот long-poll
+    for _ in range(10):
+        try:
+            r = requests.post(f"{base}/close", timeout=10)
+            time.sleep(2)
+            chk = requests.get(f"{base}/getUpdates", params={"timeout": 1}, timeout=5)
+            if chk.status_code != 409:
+                log.info("Polling slot is free.")
+                return
+        except Exception:
+            pass
+        time.sleep(3)
+    log.warning("Polling slot may still be busy, starting anyway…")import os
 import re
 import json
 import time
