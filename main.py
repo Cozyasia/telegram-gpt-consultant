@@ -1,4 +1,8 @@
-def preflight_close():
+def main():
+    preflight_close()  # <— вот здесь
+    app = ApplicationBuilder().token(TOKEN).build()
+    ...
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)def preflight_close():
     base = f"https://api.telegram.org/bot{TOKEN}"
     try:
         requests.post(f"{base}/deleteWebhook", json={"drop_pending_updates": True}, timeout=10)
