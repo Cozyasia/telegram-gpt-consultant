@@ -17,7 +17,7 @@ from telegram.ext import (
     ConversationHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
-from telegram.error import Conflict  # патч: ловим 409
+from telegram.error import Conflict  # ловим 409
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -35,8 +35,8 @@ LEADS_TAB = os.getenv("LEADS_TAB", "Leads")
 LISTINGS_TAB = os.getenv("LISTINGS_TAB", "Listings")
 
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")  # для ссылок на посты, если публичный канал
-MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "")    # куда слать уведомление о новом лиде
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
+MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
 SYSTEM_PROMPT = (
@@ -234,7 +234,7 @@ async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["requirements"] = update.message.text.strip()
-    # Поиск релевантных вариантов
+
     area = context.user_data.get("area","")
     bedrooms = int(context.user_data.get("bedrooms",1))
     budget = int(context.user_data.get("budget_thb",0))
@@ -250,7 +250,6 @@ async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Пока точных совпадений не нашёл. Я передам менеджеру ваш запрос — он предложит индивидуальные варианты в течение дня.")
 
-    # Сохранение лида
     lead = context.user_data.copy()
     lead["listing_id"] = context.user_data.get("listing_id","")
     lead_row = [
@@ -276,7 +275,6 @@ async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Ошибка записи лида в Google Sheets: %s", e)
 
-    # Уведомление менеджеру
     if MANAGER_CHAT_ID:
         try:
             text = (
@@ -312,11 +310,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Подсказка про опрос
     if re.search(r"(help|подобрать|найти|дом|вил+а|квартира|аренда)", prompt.lower()):
         await update.message.reply_text("Могу запустить быстрый опрос и предложить варианты из нашей базы. Напишите /rent.")
 
-    # Ответ ИИ
     if not OPENAI_API_KEY:
         return
     try:
@@ -338,14 +334,12 @@ async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
     await update.message.reply_text("✅ Отправил в канал.")
 
-# ---------------- ENTRY ----------------
-def main():
+# ---------------- APP builder ----------------
+def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # deep-link /start + entry help
     app.add_handler(CommandHandler("start", start))
 
-    # wizard
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_entry)],
         states={
@@ -366,16 +360,17 @@ def main():
     )
     app.add_handler(conv)
 
-    # admin posting
     app.add_handler(CommandHandler("post", post_to_channel, filters=filters.ChatType.PRIVATE))
-
-    # AI fallback
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return app
 
-    # ---- патч против 409 Conflict: переподключение ----
-    log.info("🚀 Starting polling…")
+# ---------------- ENTRY ----------------
+def main():
+    # бесконечный «переподключатель»; каждый цикл создаём НОВОЕ приложение
     while True:
         try:
+            app = build_app()
+            log.info("🚀 Starting polling…")
             app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
         except Conflict as e:
             log.warning("409 Conflict: второй инстанс ещё жив. Жду 30с и пробую снова. %s", e)
