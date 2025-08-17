@@ -10,14 +10,13 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ConversationHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ConversationHandler, ContextTypes, filters
 )
-from telegram.error import Conflict  # ловим 409
+from telegram.error import Conflict
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -159,7 +158,7 @@ async def ai_answer(prompt: str) -> str:
     msgs = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}]
     return await asyncio.to_thread(_chat_completion, msgs)
 
-# ---------------- States for Conversation ----------------
+# ---------------- Диалог-опрос ----------------
 (ASK_AREA, ASK_BEDROOMS, ASK_GUESTS, ASK_PETS, ASK_BUDGET,
  ASK_CHECKIN, ASK_CHECKOUT, ASK_TRANSFER, ASK_NAME, ASK_PHONE, ASK_REQS, DONE) = range(12)
 
@@ -176,7 +175,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /post <текст> — отправит пост в канал (админы)."
     )
 
-# ---------- Wizard ----------
 async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Начнём. Какой район Самуи предпочитаете? (например: Маенам, Бопхут, Чавенг)")
     return ASK_AREA
@@ -300,7 +298,7 @@ async def cancel_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Окей, отменил.")
     return ConversationHandler.END
 
-# ---------------- AI text fallback ----------------
+# ---------------- AI fallback ----------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -334,12 +332,44 @@ async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
     await update.message.reply_text("✅ Отправил в канал.")
 
-# ---------------- APP builder ----------------
+# ---------------- Infra helpers ----------------
+BOT_API_BASE = f"https://api.telegram.org/bot{TOKEN}"
+
+def disable_webhook():
+    try:
+        r = requests.post(f"{BOT_API_BASE}/deleteWebhook", json={"drop_pending_updates": True}, timeout=10)
+        log.info("deleteWebhook -> %s", r.status_code)
+    except Exception as e:
+        log.warning("deleteWebhook failed: %s", e)
+
+def wait_for_polling_slot():
+    """Крутим preflight getUpdates пока Bot API не перестанет отдавать 409."""
+    url = f"{BOT_API_BASE}/getUpdates"
+    while True:
+        try:
+            r = requests.get(url, params={"timeout": 0}, timeout=10)
+            if r.status_code == 409:
+                log.warning("Another getUpdates is running (409). Retrying soon…")
+                time.sleep(25)
+                continue
+            try:
+                data = r.json()
+                if isinstance(data, dict) and data.get("error_code") == 409:
+                    log.warning("Another getUpdates is running (json 409). Retrying soon…")
+                    time.sleep(25)
+                    continue
+            except Exception:
+                pass
+            log.info("Polling slot is free, starting app.")
+            return
+        except Exception as e:
+            log.warning("Preflight getUpdates failed: %s. Retry…", e)
+            time.sleep(10)
+
 def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_entry)],
         states={
@@ -359,24 +389,24 @@ def build_app():
         allow_reentry=True,
     )
     app.add_handler(conv)
-
     app.add_handler(CommandHandler("post", post_to_channel, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
 # ---------------- ENTRY ----------------
 def main():
-    # бесконечный «переподключатель»; каждый цикл создаём НОВОЕ приложение
     while True:
         try:
+            disable_webhook()
+            wait_for_polling_slot()   # <— ключевой префлайт
             app = build_app()
             log.info("🚀 Starting polling…")
             app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
         except Conflict as e:
-            log.warning("409 Conflict: второй инстанс ещё жив. Жду 30с и пробую снова. %s", e)
-            time.sleep(30)
+            log.warning("409 Conflict during run_polling. Will retry. %s", e)
+            time.sleep(25)
         except Exception:
-            log.exception("Неожиданная ошибка. Перезапуск через 10с")
+            log.exception("Unexpected error. Restarting soon")
             time.sleep(10)
 
 if __name__ == "__main__":
