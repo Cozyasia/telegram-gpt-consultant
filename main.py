@@ -17,6 +17,7 @@ from telegram.ext import (
     ConversationHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from telegram.error import Conflict  # патч: ловим 409
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -45,10 +46,14 @@ SYSTEM_PROMPT = (
 )
 
 # ---------------- Google Sheets helpers ----------------
-LISTING_HEADERS = ["id","title","area","bedrooms","price_thb","distance_to_sea_m",
-                   "pets","available_from","available_to","link","message_id","status","notes"]
-LEAD_HEADERS = ["ts","source","name","phone","area","bedrooms","guests","pets","budget_thb",
-                "check_in","check_out","transfer","requirements","listing_id","telegram_user_id","username"]
+LISTING_HEADERS = [
+    "id","title","area","bedrooms","price_thb","distance_to_sea_m",
+    "pets","available_from","available_to","link","message_id","status","notes"
+]
+LEAD_HEADERS = [
+    "ts","source","name","phone","area","bedrooms","guests","pets","budget_thb",
+    "check_in","check_out","transfer","requirements","listing_id","telegram_user_id","username"
+]
 
 def gs_client():
     creds = Credentials.from_service_account_info(
@@ -307,9 +312,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Попробуем подсказать про опрос, если фразы типичные
+    # Подсказка про опрос
     if re.search(r"(help|подобрать|найти|дом|вил+а|квартира|аренда)", prompt.lower()):
         await update.message.reply_text("Могу запустить быстрый опрос и предложить варианты из нашей базы. Напишите /rent.")
+
     # Ответ ИИ
     if not OPENAI_API_KEY:
         return
@@ -320,7 +326,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("OpenAI error: %s", e)
 
-# ---------------- Channel posting (из предыдущей версии) ----------------
+# ---------------- Channel posting ----------------
 async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Недостаточно прав.")
@@ -366,8 +372,17 @@ def main():
     # AI fallback
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    # ---- патч против 409 Conflict: переподключение ----
     log.info("🚀 Starting polling…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    while True:
+        try:
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        except Conflict as e:
+            log.warning("409 Conflict: второй инстанс ещё жив. Жду 30с и пробую снова. %s", e)
+            time.sleep(30)
+        except Exception:
+            log.exception("Неожиданная ошибка. Перезапуск через 10с")
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
