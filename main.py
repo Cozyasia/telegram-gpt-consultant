@@ -1,26 +1,4 @@
-def main():
-    preflight_close()  # <— вот здесь
-    app = ApplicationBuilder().token(TOKEN).build()
-    ...
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)def preflight_close():
-    base = f"https://api.telegram.org/bot{TOKEN}"
-    try:
-        requests.post(f"{base}/deleteWebhook", json={"drop_pending_updates": True}, timeout=10)
-    except Exception:
-        pass
-    # Пытаемся освободить слот long-poll
-    for _ in range(10):
-        try:
-            r = requests.post(f"{base}/close", timeout=10)
-            time.sleep(2)
-            chk = requests.get(f"{base}/getUpdates", params={"timeout": 1}, timeout=5)
-            if chk.status_code != 409:
-                log.info("Polling slot is free.")
-                return
-        except Exception:
-            pass
-        time.sleep(3)
-    log.warning("Polling slot may still be busy, starting anyway…")import os
+import os
 import re
 import json
 import time
@@ -32,13 +10,13 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters
+    ConversationHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
-from telegram.error import Conflict
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -67,14 +45,10 @@ SYSTEM_PROMPT = (
 )
 
 # ---------------- Google Sheets helpers ----------------
-LISTING_HEADERS = [
-    "id","title","area","bedrooms","price_thb","distance_to_sea_m",
-    "pets","available_from","available_to","link","message_id","status","notes"
-]
-LEAD_HEADERS = [
-    "ts","source","name","phone","area","bedrooms","guests","pets","budget_thb",
-    "check_in","check_out","transfer","requirements","listing_id","telegram_user_id","username"
-]
+LISTING_HEADERS = ["id","title","area","bedrooms","price_thb","distance_to_sea_m",
+                   "pets","available_from","available_to","link","message_id","status","notes"]
+LEAD_HEADERS = ["ts","source","name","phone","area","bedrooms","guests","pets","budget_thb",
+                "check_in","check_out","transfer","requirements","listing_id","telegram_user_id","username"]
 
 def gs_client():
     creds = Credentials.from_service_account_info(
@@ -180,7 +154,43 @@ async def ai_answer(prompt: str) -> str:
     msgs = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}]
     return await asyncio.to_thread(_chat_completion, msgs)
 
-# ---------------- Диалог-опрос ----------------
+# ---------------- Preflight: освобождаем polling-слот ----------------
+def preflight_release_slot(token: str, attempts: int = 8):
+    """Жестко освобождает polling-слот: deleteWebhook + close + обработка 429/409."""
+    base = f"https://api.telegram.org/bot{token}"
+    try:
+        requests.post(f"{base}/deleteWebhook", params={"drop_pending_updates": True}, timeout=10)
+        log.info("deleteWebhook -> OK")
+    except Exception as e:
+        log.warning("deleteWebhook error: %s", e)
+
+    backoff = 2
+    for i in range(1, attempts + 1):
+        try:
+            r = requests.post(f"{base}/close", timeout=10)
+            log.info("close -> %s", r.status_code)
+            chk = requests.get(f"{base}/getUpdates", params={"timeout": 1}, timeout=5)
+            if chk.status_code != 409:
+                log.info("Polling slot is free (status %s).", chk.status_code)
+                return
+            log.warning("409 Conflict still present (try %d/%d)", i, attempts)
+        except requests.RequestException as e:
+            try:
+                resp = getattr(e, "response", None)
+                if resp is not None and resp.status_code == 429:
+                    data = resp.json()
+                    wait = int(data.get("parameters", {}).get("retry_after", 5))
+                    log.warning("429 Too Many Requests. Waiting %s sec", wait)
+                    time.sleep(wait)
+                    continue
+            except Exception:
+                pass
+            log.warning("HTTP error on close/getUpdates: %s", e)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 20)
+    log.warning("Polling slot may still be busy, starting anyway…")
+
+# ---------------- States for Conversation ----------------
 (ASK_AREA, ASK_BEDROOMS, ASK_GUESTS, ASK_PETS, ASK_BUDGET,
  ASK_CHECKIN, ASK_CHECKOUT, ASK_TRANSFER, ASK_NAME, ASK_PHONE, ASK_REQS, DONE) = range(12)
 
@@ -197,6 +207,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /post <текст> — отправит пост в канал (админы)."
     )
 
+# ---------- Wizard ----------
 async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Начнём. Какой район Самуи предпочитаете? (например: Маенам, Бопхут, Чавенг)")
     return ASK_AREA
@@ -254,7 +265,6 @@ async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["requirements"] = update.message.text.strip()
-
     area = context.user_data.get("area","")
     bedrooms = int(context.user_data.get("bedrooms",1))
     budget = int(context.user_data.get("budget_thb",0))
@@ -320,7 +330,7 @@ async def cancel_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Окей, отменил.")
     return ConversationHandler.END
 
-# ---------------- AI fallback ----------------
+# ---------------- AI text fallback ----------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -332,7 +342,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if re.search(r"(help|подобрать|найти|дом|вил+а|квартира|аренда)", prompt.lower()):
         await update.message.reply_text("Могу запустить быстрый опрос и предложить варианты из нашей базы. Напишите /rent.")
-
     if not OPENAI_API_KEY:
         return
     try:
@@ -354,44 +363,13 @@ async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
     await update.message.reply_text("✅ Отправил в канал.")
 
-# ---------------- Infra helpers ----------------
-BOT_API_BASE = f"https://api.telegram.org/bot{TOKEN}"
-
-def disable_webhook():
-    try:
-        r = requests.post(f"{BOT_API_BASE}/deleteWebhook", json={"drop_pending_updates": True}, timeout=10)
-        log.info("deleteWebhook -> %s", r.status_code)
-    except Exception as e:
-        log.warning("deleteWebhook failed: %s", e)
-
-def wait_for_polling_slot():
-    """Крутим preflight getUpdates пока Bot API не перестанет отдавать 409."""
-    url = f"{BOT_API_BASE}/getUpdates"
-    while True:
-        try:
-            r = requests.get(url, params={"timeout": 0}, timeout=10)
-            if r.status_code == 409:
-                log.warning("Another getUpdates is running (409). Retrying soon…")
-                time.sleep(25)
-                continue
-            try:
-                data = r.json()
-                if isinstance(data, dict) and data.get("error_code") == 409:
-                    log.warning("Another getUpdates is running (json 409). Retrying soon…")
-                    time.sleep(25)
-                    continue
-            except Exception:
-                pass
-            log.info("Polling slot is free, starting app.")
-            return
-        except Exception as e:
-            log.warning("Preflight getUpdates failed: %s. Retry…", e)
-            time.sleep(10)
-
-def build_app():
+# ---------------- ENTRY ----------------
+def main():
+    preflight_release_slot(TOKEN)  # важный шаг против 409/429
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_entry)],
         states={
@@ -411,25 +389,12 @@ def build_app():
         allow_reentry=True,
     )
     app.add_handler(conv)
+
     app.add_handler(CommandHandler("post", post_to_channel, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    return app
 
-# ---------------- ENTRY ----------------
-def main():
-    while True:
-        try:
-            disable_webhook()
-            wait_for_polling_slot()   # <— ключевой префлайт
-            app = build_app()
-            log.info("🚀 Starting polling…")
-            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-        except Conflict as e:
-            log.warning("409 Conflict during run_polling. Will retry. %s", e)
-            time.sleep(25)
-        except Exception:
-            log.exception("Unexpected error. Restarting soon")
-            time.sleep(10)
+    log.info("🚀 Starting polling…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
