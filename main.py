@@ -1,209 +1,373 @@
 import os
+import re
+import json
+import time
 import logging
 import asyncio
-from typing import Iterable, List, Dict
+from typing import Iterable, List, Dict, Optional
 
 import requests
-from telegram import Update
+import gspread
+from google.oauth2.service_account import Credentials
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ConversationHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("cozyasia-bot")
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("cozyasia-bot")
 
-# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]                       # обязательно
-CHANNEL_ID = os.environ.get("CHANNEL_ID")                      # '@имя_канала' или '-100...'
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")                   # обязателен для ответов ИИ
+# ---------------- ENV ----------------
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
 
-# ---------- СИСТЕМНЫЙ ПРОМПТ ДЛЯ ИИ ----------
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GOOGLE_SHEETS_DB_ID = os.environ["GOOGLE_SHEETS_DB_ID"]
+LEADS_TAB = os.getenv("LEADS_TAB", "Leads")
+LISTINGS_TAB = os.getenv("LISTINGS_TAB", "Listings")
+
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")  # для ссылок на посты, если публичный канал
+MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "")    # куда слать уведомление о новом лиде
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+
 SYSTEM_PROMPT = (
-    "Ты — Cozy Asia Consultant, дружелюбный и чёткий помощник по аренде/покупке "
-    "недвижимости на Самуи (Таиланд). Отвечай на русском. "
-    "Дай по делу, кратко и полезно: стоимость, районы, расстояния до моря, сроки, депозиты, комиссии. "
-    "Если данных не хватает — задай 1 уточняющий вопрос. "
-    "Избегай воды, не придумывай фактов. Если спрашивают не по недвижимости — отвечай как обычный ассистент."
+    "Ты — Cozy Asia Consultant, дружелюбный и чёткий помощник по аренде/покупке недвижимости на Самуи. "
+    "Отвечай кратко и по делу; если сведений не хватает — задай 1 уточняющий вопрос. "
+    "Не выдумывай; приоритет — предлагать варианты из внутренней базы (таблица Listings)."
 )
 
-# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
-def is_admin(user_id: int) -> bool:
-    # если ADMIN_IDS пуст — разрешим всем
+# ---------------- Google Sheets helpers ----------------
+LISTING_HEADERS = ["id","title","area","bedrooms","price_thb","distance_to_sea_m",
+                   "pets","available_from","available_to","link","message_id","status","notes"]
+LEAD_HEADERS = ["ts","source","name","phone","area","bedrooms","guests","pets","budget_thb",
+                "check_in","check_out","transfer","requirements","listing_id","telegram_user_id","username"]
+
+def gs_client():
+    creds = Credentials.from_service_account_info(
+        json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return gspread.authorize(creds)
+
+def ws_get_or_create(sh, name: str, headers: List[str]):
+    try:
+        ws = sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(name, rows=1000, cols=40)
+        ws.append_row(headers)
+    return ws
+
+def get_ws(name: str, headers: List[str]):
+    client = gs_client()
+    sh = client.open_by_key(GOOGLE_SHEETS_DB_ID)
+    return ws_get_or_create(sh, name, headers)
+
+def listings_all() -> List[Dict]:
+    ws = get_ws(LISTINGS_TAB, LISTING_HEADERS)
+    return ws.get_all_records()
+
+def leads_append(row: List):
+    ws = get_ws(LEADS_TAB, LEAD_HEADERS)
+    ws.append_row(row)
+
+# ---------------- Utils ----------------
+def is_admin(user_id: Optional[int]) -> bool:
     return (not ADMIN_IDS) or (user_id in ADMIN_IDS)
 
-def chunk_text(text: str, limit: int = 4096):
+def chunk_text(text: str, limit: int = 4096) -> Iterable[str]:
     for i in range(0, len(text), limit):
         yield text[i:i+limit]
 
+def to_int(s: str, default: int = 0) -> int:
+    m = re.search(r"\d+", s or "")
+    return int(m.group()) if m else default
+
+def yes_no(s: str) -> Optional[bool]:
+    t = (s or "").strip().lower()
+    if t in ["да","yes","y","ага","true","1","нужно"]:
+        return True
+    if t in ["нет","no","n","false","0","не","не нужно","не надо"]:
+        return False
+    return None
+
+def listing_link(item: Dict) -> str:
+    if item.get("link"):
+        return str(item["link"])
+    mid = str(item.get("message_id") or "").strip()
+    if CHANNEL_USERNAME and mid:
+        return f"https://t.me/{CHANNEL_USERNAME}/{mid}"
+    return ""
+
+def format_listing(item: Dict) -> str:
+    parts = [
+        f"<b>{item.get('title','Без названия')}</b>",
+        f"Район: {item.get('area','?')}",
+        f"Спален: {item.get('bedrooms','?')} | Цена: {item.get('price_thb','?')} ฿/мес",
+    ]
+    if item.get("distance_to_sea_m"):
+        parts.append(f"До моря: {item['distance_to_sea_m']} м")
+    if str(item.get("pets","")).strip():
+        parts.append(f"Питомцы: {item['pets']}")
+    link = listing_link(item)
+    if link:
+        parts.append(f"\n<a href=\"{link}\">Открыть объявление</a>")
+    return "\n".join(parts)
+
+def search_listings(area: str = "", bedrooms: int = 0, budget_thb: int = 0, pets: Optional[bool] = None) -> List[Dict]:
+    items = listings_all()
+    out = []
+    for it in items:
+        if str(it.get("status","")).lower() in ["sold","inactive","hidden","закрыто","продано","сдано"]:
+            continue
+        if area and (area.lower() not in str(it.get("area","")).lower()):
+            continue
+        if bedrooms and to_int(str(it.get("bedrooms","0"))) < bedrooms:
+            continue
+        if budget_thb and to_int(str(it.get("price_thb","0"))) > budget_thb:
+            continue
+        if pets is True and str(it.get("pets","")).strip().lower() not in ["yes","да","true","разрешены","allowed"]:
+            continue
+        out.append(it)
+    out.sort(key=lambda x: to_int(str(x.get("price_thb","0"))))
+    return out[:3]
+
+# ---------------- OpenAI ----------------
 def _chat_completion(messages: List[Dict]) -> str:
-    """Синхронный вызов Chat Completions API (через requests)."""
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": messages,
-        "temperature": 0.3,
-        "max_tokens": 500,
-    }
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=OPENAI_TIMEOUT,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+        return "У меня нет доступа к OpenAI, добавьте OPENAI_API_KEY в Render → Environment."
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": OPENAI_MODEL, "messages": messages, "temperature": 0.3, "max_tokens": 500}
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
     return (data["choices"][0]["message"]["content"] or "").strip()
 
 async def ai_answer(prompt: str) -> str:
-    """Асинхронная обёртка поверх синхронного HTTP."""
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
-    return await asyncio.to_thread(_chat_completion, messages)
+    msgs = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}]
+    return await asyncio.to_thread(_chat_completion, msgs)
 
-# ---------- ХЕНДЛЕРЫ /start, /post, фото-в-канал ----------
+# ---------------- States for Conversation ----------------
+(ASK_AREA, ASK_BEDROOMS, ASK_GUESTS, ASK_PETS, ASK_BUDGET,
+ ASK_CHECKIN, ASK_CHECKOUT, ASK_TRANSFER, ASK_NAME, ASK_PHONE, ASK_REQS, DONE) = range(12)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    param = " ".join(context.args) if context.args else ""
+    if param.startswith("lead_") or param.startswith("listing_"):
+        context.user_data["listing_id"] = param.split("_",1)[1]
+        await update.message.reply_text("Ок, начнём подбор по этому объявлению. Скажите, какой район вам удобен?")
+        return ASK_AREA
     await update.message.reply_text(
         "✅ Бот запущен.\n"
-        "Команды:\n"
-        "• /post <текст> — отправит пост в канал (если задан CHANNEL_ID)\n"
-        "• Отправь фото с подписью — улетит в канал как картинка\n"
-        "• Просто напиши вопрос — отвечу как консультант Cozy Asia"
+        "• Напишите свой запрос — отвечу и предложу варианты из базы.\n"
+        "• Команда /rent — запущу опрос и сформирую заявку.\n"
+        "• /post <текст> — отправит пост в канал (админы)."
     )
 
-async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        await update.message.reply_text("🚫 Недостаточно прав.")
-        return
-    if not CHANNEL_ID:
-        await update.message.reply_text("❗️CHANNEL_ID не задан в переменных окружения Render.")
-        return
+# ---------- Wizard ----------
+async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Начнём. Какой район Самуи предпочитаете? (например: Маенам, Бопхут, Чавенг)")
+    return ASK_AREA
 
-    text = " ".join(context.args).strip()
-    if not text and update.message and update.message.reply_to_message:
-        src = update.message.reply_to_message
-        text = (src.text or src.caption or "").strip()
+async def ask_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["area"] = update.message.text.strip()
+    await update.message.reply_text("Сколько спален нужно?")
+    return ASK_BEDROOMS
 
-    if not text:
-        await update.message.reply_text("ℹ️ Использование: /post <текст> (или ответь /post на сообщение).")
-        return
+async def ask_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["bedrooms"] = to_int(update.message.text, 1)
+    await update.message.reply_text("Сколько гостей будет проживать?")
+    return ASK_GUESTS
 
-    sent = 0
-    for chunk in chunk_text(text):
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=chunk,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
-        )
-        sent += 1
-    await update.message.reply_text(f"✅ Отправлено в канал ({sent} сообщ.).")
+async def ask_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["guests"] = to_int(update.message.text, 1)
+    await update.message.reply_text("Питомцы будут? (да/нет)")
+    return ASK_PETS
 
-async def photo_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-    if not CHANNEL_ID or not update.message:
-        return
+async def ask_pets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    yn = yes_no(update.message.text)
+    context.user_data["pets"] = yn if yn is not None else False
+    await update.message.reply_text("Какой бюджет на месяц (в батах)?")
+    return ASK_BUDGET
+
+async def ask_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["budget_thb"] = to_int(update.message.text, 0)
+    await update.message.reply_text("Дата заезда (например: 2025-09-01)?")
+    return ASK_CHECKIN
+
+async def ask_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["check_in"] = update.message.text.strip()
+    await update.message.reply_text("Дата выезда (например: 2026-03-01)?")
+    return ASK_CHECKOUT
+
+async def ask_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["check_out"] = update.message.text.strip()
+    await update.message.reply_text("Нужен ли трансфер из аэропорта? (да/нет)")
+    return ASK_TRANSFER
+
+async def ask_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["transfer"] = yes_no(update.message.text) is True
+    await update.message.reply_text("Ваше имя и фамилия?")
+    return ASK_NAME
+
+async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text("Контактный телефон (включая код страны)?")
+    return ASK_PHONE
+
+async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = update.message.text.strip()
+    await update.message.reply_text("Есть ли дополнительные требования? (вид на море, бассейн, рабочее место и т.д.)")
+    return ASK_REQS
+
+async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["requirements"] = update.message.text.strip()
+    # Поиск релевантных вариантов
+    area = context.user_data.get("area","")
+    bedrooms = int(context.user_data.get("bedrooms",1))
+    budget = int(context.user_data.get("budget_thb",0))
+    pets = context.user_data.get("pets", False)
+
+    matches = search_listings(area=area, bedrooms=bedrooms, budget_thb=budget, pets=pets)
+
+    if matches:
+        await update.message.reply_text("Подобрал варианты из нашей базы (первые 3):")
+        for it in matches:
+            for chunk in chunk_text(format_listing(it)):
+                await update.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+    else:
+        await update.message.reply_text("Пока точных совпадений не нашёл. Я передам менеджеру ваш запрос — он предложит индивидуальные варианты в течение дня.")
+
+    # Сохранение лида
+    lead = context.user_data.copy()
+    lead["listing_id"] = context.user_data.get("listing_id","")
+    lead_row = [
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        "bot",
+        lead.get("name",""),
+        lead.get("phone",""),
+        lead.get("area",""),
+        lead.get("bedrooms",""),
+        lead.get("guests",""),
+        "да" if lead.get("pets") else "нет",
+        lead.get("budget_thb",""),
+        lead.get("check_in",""),
+        lead.get("check_out",""),
+        "да" if lead.get("transfer") else "нет",
+        lead.get("requirements",""),
+        lead.get("listing_id",""),
+        str(update.effective_user.id if update.effective_user else ""),
+        update.effective_user.username if update.effective_user and update.effective_user.username else "",
+    ]
     try:
-        if update.message.photo:
-            file_id = update.message.photo[-1].file_id
-            caption = update.message.caption or ""
-            await context.bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=file_id,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-            await update.message.reply_text("✅ Фото отправлено в канал.")
-        elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
-            file_id = update.message.document.file_id
-            caption = update.message.caption or ""
-            await context.bot.send_document(
-                chat_id=CHANNEL_ID,
-                document=file_id,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-            await update.message.reply_text("✅ Изображение (документ) отправлено в канал.")
+        leads_append(lead_row)
     except Exception as e:
-        logger.exception("Ошибка отправки фото в канал")
-        await update.message.reply_text(f"❗️Ошибка отправки: {e}")
+        log.exception("Ошибка записи лида в Google Sheets: %s", e)
 
-# ---------- ГЛАВНЫЙ ХЕНДЛЕР ТЕКСТА (ИИ-ОТВЕТ) ----------
+    # Уведомление менеджеру
+    if MANAGER_CHAT_ID:
+        try:
+            text = (
+                "<b>Новая заявка</b>\n"
+                f"Имя: {lead.get('name')}\nТел: {lead.get('phone')}\n"
+                f"Район: {lead.get('area')} | Спален: {lead.get('bedrooms')} | Гостей: {lead.get('guests')}\n"
+                f"Питомцы: {'да' if lead.get('pets') else 'нет'} | Бюджет: {lead.get('budget_thb')} ฿\n"
+                f"Даты: {lead.get('check_in')} → {lead.get('check_out')} | Трансфер: {'да' if lead.get('transfer') else 'нет'}\n"
+                f"Пожелания: {lead.get('requirements')}\n"
+                f"Listing ID: {lead.get('listing_id')}\n"
+                f"TG: @{update.effective_user.username if update.effective_user and update.effective_user.username else update.effective_user.id}"
+            )
+            await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+        except Exception:
+            log.exception("Не удалось отправить уведомление менеджеру")
+
+    await update.message.reply_text("Спасибо! Заявка зафиксирована. Менеджер Cozy Asia свяжется с вами.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Окей, отменил.")
+    return ConversationHandler.END
+
+# ---------------- AI text fallback ----------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    user_text = update.message.text.strip()
-
-    # индикация "печатает..."
+    prompt = update.message.text.strip()
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     except Exception:
         pass
 
+    # Попробуем подсказать про опрос, если фразы типичные
+    if re.search(r"(help|подобрать|найти|дом|вил+а|квартира|аренда)", prompt.lower()):
+        await update.message.reply_text("Могу запустить быстрый опрос и предложить варианты из нашей базы. Напишите /rent.")
+    # Ответ ИИ
     if not OPENAI_API_KEY:
-        await update.message.reply_text(
-            "Чтобы я отвечал как ИИ-консультант, добавь переменную OPENAI_API_KEY в Render → Environment, "
-            "а затем перезапусти сервис."
-        )
         return
-
     try:
-        reply = await ai_answer(user_text)
-    except requests.exceptions.HTTPError as e:
-        logger.exception("OpenAI HTTP error")
-        code = getattr(e.response, "status_code", "?")
-        await update.message.reply_text(f"❗️OpenAI HTTP error ({code}). Попробуй ещё раз.")
-        return
+        reply = await ai_answer(prompt)
+        for chunk in chunk_text(reply):
+            await update.message.reply_text(chunk)
     except Exception as e:
-        logger.exception("OpenAI error")
-        await update.message.reply_text(f"❗️Ошибка ИИ: {e}")
+        log.exception("OpenAI error: %s", e)
+
+# ---------------- Channel posting (из предыдущей версии) ----------------
+async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 Недостаточно прав.")
         return
+    if not CHANNEL_ID:
+        await update.message.reply_text("❗️CHANNEL_ID не задан в Environment.")
+        return
+    text = " ".join(context.args).strip() or "Тест из бота 🚀"
+    await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text("✅ Отправил в канал.")
 
-    for chunk in chunk_text(reply):
-        await update.message.reply_text(chunk)
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Ошибка в обработчике:", exc_info=context.error)
-
-# ---------- ТОЧКА ВХОДА ----------
+# ---------------- ENTRY ----------------
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Команды — только из лички
-    app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    # deep-link /start + entry help
+    app.add_handler(CommandHandler("start", start))
+
+    # wizard
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("rent", rent_entry)],
+        states={
+            ASK_AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_area)],
+            ASK_BEDROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_bedrooms)],
+            ASK_GUESTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_guests)],
+            ASK_PETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_pets)],
+            ASK_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_budget)],
+            ASK_CHECKIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_checkin)],
+            ASK_CHECKOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_checkout)],
+            ASK_TRANSFER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_transfer)],
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
+            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
+            ASK_REQS: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_lead)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_wizard)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
+
+    # admin posting
     app.add_handler(CommandHandler("post", post_to_channel, filters=filters.ChatType.PRIVATE))
 
-    # Фото → канал (личка)
-    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_to_channel))
-    app.add_handler(MessageHandler(filters.Document.IMAGE & filters.ChatType.PRIVATE, photo_to_channel))
-
-    # Текст → ответ ИИ (во всех чатах)
+    # AI fallback
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.add_error_handler(error_handler)
-
-    logger.info("🚀 Starting polling…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("🚀 Starting polling…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
