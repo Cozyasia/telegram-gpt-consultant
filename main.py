@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import json
@@ -10,12 +11,11 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ConversationHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ConversationHandler, ContextTypes, filters
 )
 
 # ---------------- LOGGING ----------------
@@ -23,20 +23,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("cozyasia-bot")
 
 # ---------------- ENV ----------------
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+if not TOKEN:
+    raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is missing")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
 
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-GOOGLE_SHEETS_DB_ID = os.environ["GOOGLE_SHEETS_DB_ID"]
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEETS_DB_ID = os.environ.get("GOOGLE_SHEETS_DB_ID", "").strip()
 LEADS_TAB = os.getenv("LEADS_TAB", "Leads")
 LISTINGS_TAB = os.getenv("LISTINGS_TAB", "Listings")
 
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
-MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "")
+CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()
+MANAGER_CHAT_ID_RAW = os.getenv("MANAGER_CHAT_ID", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+
+def _parse_chat_id(s: str):
+    """Возвращает int для числовых chat_id (в т.ч. отрицательных), иначе строку."""
+    if not s:
+        return ""
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return s
+
+CHANNEL_ID = _parse_chat_id(CHANNEL_ID_RAW)
+MANAGER_CHAT_ID = _parse_chat_id(MANAGER_CHAT_ID_RAW)
 
 SYSTEM_PROMPT = (
     "Ты — Cozy Asia Consultant, дружелюбный и чёткий помощник по аренде/покупке недвижимости на Самуи. "
@@ -51,6 +65,8 @@ LEAD_HEADERS = ["ts","source","name","phone","area","bedrooms","guests","pets","
                 "check_in","check_out","transfer","requirements","listing_id","telegram_user_id","username"]
 
 def gs_client():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEETS_DB_ID:
+        raise RuntimeError("Google Sheets env vars are missing")
     creds = Credentials.from_service_account_info(
         json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -194,6 +210,7 @@ def preflight_release_slot(token: str, attempts: int = 8):
 (ASK_AREA, ASK_BEDROOMS, ASK_GUESTS, ASK_PETS, ASK_BUDGET,
  ASK_CHECKIN, ASK_CHECKOUT, ASK_TRANSFER, ASK_NAME, ASK_PHONE, ASK_REQS, DONE) = range(12)
 
+# ---------------- Handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Я уже тут!\n"
@@ -202,13 +219,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "сформирую заявку, предложу варианты и передам менеджеру. "
         "Он свяжется с вами для уточнения деталей и бронирования ✨"
     )
-
-if __name__ == "__main__":
-    app = ApplicationBuilder().token("ТВОЙ_ТОКЕН").build()
-
-    app.add_handler(CommandHandler("start", start))
-
-    app.run_polling()
 
 # ---------- Wizard ----------
 async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,8 +381,10 @@ def main():
     preflight_release_slot(TOKEN)  # важный шаг против 409/429
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # /start
     app.add_handler(CommandHandler("start", start))
 
+    # /rent conversation
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_entry)],
         states={
@@ -393,11 +405,14 @@ def main():
     )
     app.add_handler(conv)
 
+    # /post (только в личке и только админам)
     app.add_handler(CommandHandler("post", post_to_channel, filters=filters.ChatType.PRIVATE))
+
+    # AI-ответы по умолчанию
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("🚀 Starting polling…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True)  # allowed_updates по умолчанию
 
 if __name__ == "__main__":
     main()
