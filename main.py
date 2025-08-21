@@ -195,17 +195,20 @@ def preflight_release_slot(token: str, attempts: int = 8):
  ASK_CHECKIN, ASK_CHECKOUT, ASK_TRANSFER, ASK_NAME, ASK_PHONE, ASK_REQS, DONE) = range(12)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    param = " ".join(context.args) if context.args else ""
-    if param.startswith("lead_") or param.startswith("listing_"):
-        context.user_data["listing_id"] = param.split("_",1)[1]
-        await update.message.reply_text("Ок, начнём подбор по этому объявлению. Скажите, какой район вам удобен?")
-        return ASK_AREA
     await update.message.reply_text(
-        "✅ Бот запущен.\n"
-        "• Напишите свой запрос — отвечу и предложу варианты из базы.\n"
-        "• Команда /rent — запущу опрос и сформирую заявку.\n"
-        "• /post <текст> — отправит пост в канал (админы)."
+        "✅ Я уже тут!\n"
+        "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n\n"
+        "👉 Или нажми команду /rent — я задам несколько вопросов о жилье, "
+        "сформирую заявку, предложу варианты и передам менеджеру. "
+        "Он свяжется с вами для уточнения деталей и бронирования ✨"
     )
+
+if __name__ == "__main__":
+    app = ApplicationBuilder().token("ТВОЙ_ТОКЕН").build()
+
+    app.add_handler(CommandHandler("start", start))
+
+    app.run_polling()
 
 # ---------- Wizard ----------
 async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
