@@ -18,11 +18,11 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 
-# ------------- LOGGING -------------
+# ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("cozyasia-bot")
 
-# ------------- ENV -------------
+# ---------- ENV ----------
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is missing")
@@ -41,12 +41,12 @@ CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()
 MANAGER_CHAT_ID_RAW = os.getenv("MANAGER_CHAT_ID", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
-def _parse_chat_id(s: str) -> Union[int, str, None]:
+def _parse_chat_id(s: str) -> Union[int, None]:
     if not s:
         return None
     if s.lstrip("-").isdigit():
         return int(s)
-    return s  # например, @channelusername (но для send_message нужен числовой id)
+    return None  # для send_message всё же нужен числовой id
 
 CHANNEL_ID = _parse_chat_id(CHANNEL_ID_RAW)
 MANAGER_CHAT_ID = _parse_chat_id(MANAGER_CHAT_ID_RAW)
@@ -57,7 +57,7 @@ SYSTEM_PROMPT = (
     "Не выдумывай; приоритет — предлагать варианты из внутренней базы (таблица Listings)."
 )
 
-# ------------- Google Sheets -------------
+# ---------- Google Sheets ----------
 LISTING_HEADERS = ["id","title","area","bedrooms","price_thb","distance_to_sea_m",
                    "pets","available_from","available_to","link","message_id","status","notes"]
 LEAD_HEADERS = ["ts","source","name","phone","area","bedrooms","guests","pets","budget_thb",
@@ -93,7 +93,7 @@ def leads_append(row: List):
     ws = get_ws(LEADS_TAB, LEAD_HEADERS)
     ws.append_row(row)
 
-# ------------- Utils -------------
+# ---------- Utils ----------
 def is_admin(user_id: Optional[int]) -> bool:
     return (not ADMIN_IDS) or (user_id in ADMIN_IDS)
 
@@ -154,7 +154,7 @@ def search_listings(area: str = "", bedrooms: int = 0, budget_thb: int = 0, pets
     out.sort(key=lambda x: to_int(str(x.get("price_thb","0"))))
     return out[:3]
 
-# ------------- OpenAI -------------
+# ---------- OpenAI ----------
 def _chat_completion(messages: List[Dict]) -> str:
     if not OPENAI_API_KEY:
         return "У меня нет доступа к OpenAI, добавьте OPENAI_API_KEY в Render → Environment."
@@ -169,22 +169,21 @@ async def ai_answer(prompt: str) -> str:
     msgs = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}]
     return await asyncio.to_thread(_chat_completion, msgs)
 
-# ------------- Preflight: освобождаем polling-слот (409/конфликты) -------------
-def preflight_release_slot(token: str, attempts: int = 5):
-    """deleteWebhook -> close -> logOut + проверка 409; максимально размыкает зависшие сессии."""
+# ---------- Preflight: сброс long-poll без logOut ----------
+def preflight_release_slot(token: str, attempts: int = 6):
+    """deleteWebhook -> close + проверка 409. Не используем logOut (ломает Cloud Bot API)."""
     base = f"https://api.telegram.org/bot{token}"
 
     def _post(method, **params):
         try:
             r = requests.post(f"{base}/{method}", params=params, timeout=10)
-            return r.status_code, (r.json() if "application/json" in r.headers.get("Content-Type","") else None)
+            return r.status_code
         except Exception as e:
             log.warning("%s error: %s", method, e)
-            return None, None
+            return None
 
-    _post("deleteWebhook", drop_pending_updates=True)
-    _post("close")
-    _post("logOut")
+    _post("deleteWebhook", drop_pending_updates=True)  # очистить очередь
+    _post("close")  # закрыть висящие getUpdates
 
     backoff = 2
     for i in range(1, attempts + 1):
@@ -197,14 +196,14 @@ def preflight_release_slot(token: str, attempts: int = 5):
         except Exception as e:
             log.warning("getUpdates check error: %s", e)
         time.sleep(backoff)
-        backoff = min(backoff * 2, 10)
+        backoff = min(backoff * 2, 8)
     log.warning("Polling slot may still be busy, starting anyway…")
 
-# ------------- States -------------
+# ---------- States ----------
 (ASK_AREA, ASK_BEDROOMS, ASK_GUESTS, ASK_PETS, ASK_BUDGET,
  ASK_CHECKIN, ASK_CHECKOUT, ASK_TRANSFER, ASK_NAME, ASK_PHONE, ASK_REQS, DONE) = range(12)
 
-# ------------- Handlers -------------
+# ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Я уже тут!\n"
@@ -214,7 +213,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Он свяжется с вами для уточнения деталей и бронирования ✨"
     )
 
-# ---- Wizard /rent ----
+# ---- /rent ----
 async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Начнём. Какой район Самуи предпочитаете? (например: Маенам, Бопхут, Чавенг)")
     return ASK_AREA
@@ -277,7 +276,6 @@ async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     budget = int(context.user_data.get("budget_thb",0))
     pets = context.user_data.get("pets", False)
 
-    # Показать первые варианты
     try:
         matches = search_listings(area=area, bedrooms=bedrooms, budget_thb=budget, pets=pets)
     except Exception as e:
@@ -292,7 +290,6 @@ async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Пока точных совпадений не нашёл. Я передам менеджеру ваш запрос — он предложит индивидуальные варианты в течение дня.")
 
-    # Сохранить лид
     u = update.effective_user
     lead = context.user_data.copy()
     lead["listing_id"] = context.user_data.get("listing_id","")
@@ -319,7 +316,6 @@ async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Ошибка записи лида в Google Sheets: %s", e)
 
-    # Уведомить менеджера
     if MANAGER_CHAT_ID:
         try:
             text = (
@@ -371,7 +367,7 @@ async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Недостаточно прав.")
         return
-    if not CHANNEL_ID:
+    if CHANNEL_ID is None:
         await update.message.reply_text("❗️CHANNEL_ID не задан в Environment.")
         return
     text = " ".join(context.args).strip() or "Тест из бота 🚀"
@@ -382,9 +378,9 @@ async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Post to channel error: %s", e)
         await update.message.reply_text("Не удалось отправить в канал (см. логи).")
 
-# ------------- ENTRY -------------
+# ---------- ENTRY ----------
 def main():
-    preflight_release_slot(TOKEN)  # ключевой шаг против 409/«only one bot instance»
+    preflight_release_slot(TOKEN)  # мягкий сброс long-poll
     app = ApplicationBuilder().token(TOKEN).build()
 
     # /start
