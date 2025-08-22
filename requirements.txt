@@ -2,3 +2,4 @@ python-telegram-bot==21.4
 requests>=2.32.0
 gspread>=6.0.0
 google-auth>=2.30.0
+aiohttp>=3.9.5  # для webhook-сервера PTB
