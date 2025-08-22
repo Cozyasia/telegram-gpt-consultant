@@ -1,155 +1,115 @@
-# backfill_render.py — импорт ВСЕХ старых постов канала в лист Listings (Render-режим, без интерактива)
-import os, re, json, time, sys
+# backfill_render.py
+import os
+import re
+import asyncio
+from datetime import datetime
+
 import gspread
 from google.oauth2.service_account import Credentials
+
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
+from telethon.sessions import StringSession  # не используется в бот-режиме, но пусть будет
 
-LISTING_HEADERS = [
-    "id","title","area","bedrooms","price_thb","distance_to_sea_m",
-    "pets","available_from","available_to","link","message_id","status","notes"
-]
+API_ID = int(os.environ["TELEGRAM_API_ID"])
+API_HASH = os.environ["TELEGRAM_API_HASH"]
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+SESSION_STR = os.environ.get("TELEGRAM_SESSION")  # на всякий случай поддерживаем и этот путь
 
-LOT_RE   = re.compile(r"(?:Лот|Lot)[^\d]*(\d+)", re.I)
-AREA_RE  = re.compile(r"(?:Район|Area)\s*[:\-]\s*([^\n]+)", re.I)
-BEDS_RE  = re.compile(r"(?:спален|спальн|bedrooms?)\s*[:\-]?\s*(\d+)", re.I)
-PRICE_RE = re.compile(r"(?:цена|price)\s*[:\-]?\s*([\d\s]+)", re.I)
+CHANNEL = os.environ.get("CHANNEL_USERNAME") or os.environ.get("CHANNEL")
+SHEET_ID = os.environ["GOOGLE_SHEETS_DB_ID"]
+TAB = os.environ.get("LISTINGS_TAB", "Listings")
+GSA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-def to_int(s, default=0):
-    m = re.search(r"\d+", s or "")
-    return int(m.group()) if m else default
-
-def parse_listing_text(text: str) -> dict:
-    t = text or ""
-    lot = LOT_RE.search(t)
-    area = AREA_RE.search(t)
-    beds = BEDS_RE.search(t)
-    price = PRICE_RE.search(t)
-    return {
-        "id": (lot.group(1) if lot else ""),
-        "area": (area.group(1).strip() if area else ""),
-        "bedrooms": to_int(beds.group(1) if beds else ""),
-        "price_thb": to_int(price.group(1) if price else ""),
-        "title": t.splitlines()[0][:120] if t else "Без названия",
-        "status": "active",
-    }
-
-def _load_gsa():
-    gsa = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not gsa:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
-    if gsa.startswith("{"):
-        return json.loads(gsa)
-    with open(gsa, "r", encoding="utf-8") as f:
-        return json.load(f)
+def parse_price_bedrooms(text: str):
+    price = None
+    m = re.search(r'(?:(?:฿|THB)\s*)?([0-9]{2,3}(?:[ \u00A0]?[0-9]{3})+|[0-9]{4,6})\b', text, re.I)
+    if m:
+        price = int(re.sub(r'\D', '', m.group(1)))
+    br = None
+    m2 = re.search(r'(\d+)\s*(?:спал|bed|br)', text, re.I)
+    if m2:
+        br = int(m2.group(1))
+    return price, br
 
 def open_listings_ws():
+    import json
+    info = json.loads(GSA_JSON)
     creds = Credentials.from_service_account_info(
-        _load_gsa(), scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"]
     )
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(os.environ["GOOGLE_SHEETS_DB_ID"])
-    tab = os.getenv("LISTINGS_TAB", "Listings")
+    sh = gc.open_by_key(SHEET_ID)
     try:
-        ws = sh.worksheet(tab)
+        ws = sh.worksheet(TAB)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(tab, rows=2000, cols=40)
-        ws.append_row(LISTING_HEADERS)
+        ws = sh.add_worksheet(TAB, rows=1000, cols=20)
+        ws.update("A1:H1", [[
+            "ts", "source", "tg_message_id", "channel", "title",
+            "price", "bedrooms", "text"
+        ]])
     return ws
 
-def get_existing_message_ids(ws):
-    existing = set()
-    for row in ws.get_all_records():
-        mid = str(row.get("message_id","")).strip()
-        if mid:
-            existing.add(mid)
-    return existing
+async def get_client():
+    if BOT_TOKEN:
+        client = TelegramClient("bot", API_ID, API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        return client
+    elif SESSION_STR:
+        client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("TELEGRAM_SESSION не авторизована.")
+        return client
+    else:
+        raise RuntimeError("Задай TELEGRAM_BOT_TOKEN (или TELEGRAM_SESSION). Интерактив запрещён.")
 
-def private_link_from_ids(chat_id: int, msg_id: int) -> str:
-    # -100xxxxxxxxxx -> xxxxxxxxxx
-    cid = str(abs(chat_id))
-    if cid.startswith("100"):
-        cid = cid[3:]
-    return f"https://t.me/c/{cid}/{msg_id}"
-
-def main():
+async def backfill():
     print("==> Backfill started")
-    # ---- ENV (в Render укажем всё в Environment) ----
-    api_id   = int(os.environ["TELEGRAM_API_ID"])
-    api_hash = os.environ["TELEGRAM_API_HASH"]
-    phone    = os.getenv("TELEGRAM_PHONE", "").strip()
-    login_code = os.getenv("TELEGRAM_LOGIN_CODE", "").strip()        # одноразовый код из Telegram
-    code_hash  = os.getenv("TELEGRAM_CODE_HASH", "").strip()         # хэш, который попросим сохранить при первом запуске
-    twofa      = os.getenv("TELEGRAM_2FA_PASSWORD", "").strip()      # если включён 2FA
-    channel    = os.environ.get("CHANNEL_USERNAME") or os.environ.get("CHANNEL")
-    if not channel:
-        raise RuntimeError("Set CHANNEL_USERNAME (без @) или CHANNEL")
-
+    if not CHANNEL:
+        raise RuntimeError("Не указаны CHANNEL_USERNAME/CHANNEL.")
     ws = open_listings_ws()
-    existing = get_existing_message_ids(ws)
 
-    client = TelegramClient("import_session", api_id, api_hash)  # файл сессии в контейнере
+    existing_ids = set()
+    try:
+        for v in ws.col_values(3)[1:]:
+            if v:
+                existing_ids.add(v.strip())
+    except Exception:
+        pass
 
-    with client:
-        # --- без интерактива: если сессии нет, проводим вход через переменные окружения ---
-        if not client.is_user_authorized():
-            if not phone:
-                raise RuntimeError("TELEGRAM_PHONE must be set (в формате +79990000000).")
+    client = await get_client()
+    entity = CHANNEL[1:] if CHANNEL.startswith("@") else CHANNEL
 
-            # Если кода нет — запрашиваем код, печатаем CODE_HASH и завершаем, чтобы вы добавили переменные и перезапустили.
-            if not login_code:
-                print("==> Sending login code to your Telegram...")
-                sent = client.send_code_request(phone)
-                print(f"==> CODE_HASH (сохраните в Environment как TELEGRAM_CODE_HASH): {sent.phone_code_hash}")
-                print("==> Теперь добавьте TELEGRAM_LOGIN_CODE (из Telegram) и TELEGRAM_CODE_HASH, затем Redeploy.")
-                sys.exit(1)
+    new_rows = []
+    async for msg in client.iter_messages(entity, limit=1000):
+        if not msg or not msg.id:
+            continue
+        msg_id = str(msg.id)
+        if msg_id in existing_ids:
+            continue
 
-            # Если код есть, завершаем вход
-            try:
-                if code_hash:
-                    client.sign_in(phone=phone, code=login_code, phone_code_hash=code_hash)
-                else:
-                    client.sign_in(phone=phone, code=login_code)
-            except SessionPasswordNeededError:
-                if not twofa:
-                    raise RuntimeError("Включён 2FA. Укажите TELEGRAM_2FA_PASSWORD и Redeploy.")
-                client.sign_in(password=twofa)
-            except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-                raise RuntimeError("Код неверный/просрочен. Удалите TELEGRAM_LOGIN_CODE, Redeploy, получите новый CODE_HASH и код.")
+        text = (msg.message or "").strip() or (msg.caption or "").strip()
+        price, br = parse_price_bedrooms(text or "")
+        title = (text.splitlines()[0][:120] if text else "")
 
-        # --- импорт сообщений ---
-        entity = client.get_entity(channel)
-        chan_username = getattr(entity, "username", None)
+        ts = (msg.date or datetime.utcnow()).strftime("%Y-%m-%d %H:%M:%S")
+        new_rows.append([
+            ts, "channel", msg_id, str(CHANNEL), title,
+            price if price is not None else "", br if br is not None else "", text
+        ])
 
-        added = 0
-        scanned = 0
-        for msg in client.iter_messages(entity, limit=None):
-            scanned += 1
-            text = (getattr(msg, "text", None) or getattr(msg, "message", None) or getattr(msg, "caption", None) or "")
-            if not text:
-                continue
-            mid = str(msg.id)
-            if mid in existing:
-                continue
+        if len(new_rows) >= 100:
+            ws.append_rows(new_rows, value_input_option="RAW")
+            print("...saved 100 rows")
+            new_rows.clear()
 
-            item = parse_listing_text(text)
-            item["message_id"] = mid
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="RAW")
 
-            if chan_username:
-                item["link"] = f"https://t.me/{chan_username}/{mid}"
-            else:
-                item["link"] = private_link_from_ids(msg.chat_id, msg.id)
-
-            for k in LISTING_HEADERS:
-                item.setdefault(k, "")
-
-            ws.append_row([item.get(h,"") for h in LISTING_HEADERS])
-            existing.add(mid)
-            added += 1
-            # бережно к API Sheets
-            time.sleep(0.15)
-
-        print(f"==> Done. Scanned: {scanned}, added: {added}")
+    await client.disconnect()
+    print("==> Backfill finished")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(backfill())
