@@ -1,14 +1,8 @@
 # main.py
-import os
-import re
-import json
-import time
-import logging
-import asyncio
+import os, re, json, time, logging, asyncio
 from typing import Iterable, List, Dict, Optional, Union
 
-import requests
-import gspread
+import requests, gspread
 from google.oauth2.service_account import Credentials
 
 from telegram import Update
@@ -18,35 +12,35 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ---------- LOGGING ----------
+# ========= LOGGING =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("cozyasia-bot")
 
-# ---------- ENV ----------
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+# ========= ENV =========
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is missing")
+    raise RuntimeError("Env TELEGRAM_BOT_TOKEN is missing")
+
+# webhook-режим включится, если задан публичный базовый URL сервиса (Render)
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")  # например: https://your-service.onrender.com
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "tg-webhook")      # часть пути, можно любая строка
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
 
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-GOOGLE_SHEETS_DB_ID = os.environ.get("GOOGLE_SHEETS_DB_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEETS_DB_ID = os.getenv("GOOGLE_SHEETS_DB_ID", "").strip()
 LEADS_TAB = os.getenv("LEADS_TAB", "Leads")
 LISTINGS_TAB = os.getenv("LISTINGS_TAB", "Listings")
 
 CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()  # для публичного канала
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()   # для публичного канала
 MANAGER_CHAT_ID_RAW = os.getenv("MANAGER_CHAT_ID", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
 def _parse_chat_id(s: str) -> Union[int, None]:
-    if not s:
-        return None
-    if s.lstrip("-").isdigit():
-        return int(s)
-    return None
+    return int(s) if s and s.lstrip("-").isdigit() else None
 
 CHANNEL_ID = _parse_chat_id(CHANNEL_ID_RAW)
 MANAGER_CHAT_ID = _parse_chat_id(MANAGER_CHAT_ID_RAW)
@@ -57,7 +51,7 @@ SYSTEM_PROMPT = (
     "Приоритет — предлагать варианты из внутренней базы (таблица Listings)."
 )
 
-# ---------- Google Sheets ----------
+# ========= Google Sheets =========
 LISTING_HEADERS = [
     "id","title","area","bedrooms","price_thb","distance_to_sea_m",
     "pets","available_from","available_to","link","message_id","status","notes"
@@ -97,29 +91,20 @@ def leads_append(row: List):
     ws = get_ws(LEADS_TAB, LEAD_HEADERS)
     ws.append_row(row)
 
-# ---------- Listings upsert (по message_id) ----------
 def listings_upsert_by_message(parsed: Dict[str, str], message_id: str):
-    """
-    Upsert в таб Listings по полю message_id.
-    parsed: id,title,area,bedrooms,price_thb,link,message_id,status,notes
-    Пустые значения не перезаписывают существующие.
-    """
     ws = get_ws(LISTINGS_TAB, LISTING_HEADERS)
-    header = ws.row_values(1)
-    if not header:
+    header = ws.row_values(1) or LISTING_HEADERS
+    if not ws.row_values(1):
         ws.append_row(LISTING_HEADERS)
-        header = LISTING_HEADERS
     col_map = {name: idx+1 for idx, name in enumerate(header)}
 
     msg_col = col_map.get("message_id")
-    existing_ids = ws.col_values(msg_col) if msg_col else []
+    existing = ws.col_values(msg_col) if msg_col else []
     target_row = None
-    for r, val in enumerate(existing_ids, start=1):
-        if r == 1:
-            continue
+    for r, val in enumerate(existing, start=1):
+        if r == 1: continue
         if str(val).strip() == str(message_id):
-            target_row = r
-            break
+            target_row = r; break
 
     if target_row is None:
         new_row = [""] * len(header)
@@ -127,22 +112,18 @@ def listings_upsert_by_message(parsed: Dict[str, str], message_id: str):
             if k in col_map and str(v) != "":
                 new_row[col_map[k]-1] = str(v)
         ws.append_row(new_row)
-        log.info("Listings: appended new row for message_id=%s", message_id)
+        log.info("Listings: append row for message_id=%s", message_id)
         return
 
-    updates = []
+    # update only non-empty incoming fields
+    cell_list = ws.range(target_row, 1, target_row, len(header))
     for k, v in parsed.items():
         if k in col_map and str(v) != "":
-            updates.append((col_map[k], str(v)))
+            cell_list[col_map[k]-1].value = str(v)
+    ws.update_cells(cell_list, value_input_option="USER_ENTERED")
+    log.info("Listings: update row %s for message_id=%s", target_row, message_id)
 
-    if updates:
-        cell_list = ws.range(target_row, 1, target_row, len(header))
-        for col_idx, value in updates:
-            cell_list[col_idx-1].value = value
-        ws.update_cells(cell_list, value_input_option="USER_ENTERED")
-        log.info("Listings: updated row %s for message_id=%s", target_row, message_id)
-
-# ---------- Utils ----------
+# ========= Utils =========
 def is_admin(user_id: Optional[int]) -> bool:
     return (not ADMIN_IDS) or (user_id in ADMIN_IDS)
 
@@ -156,10 +137,8 @@ def to_int(s: str, default: int = 0) -> int:
 
 def yes_no(s: str) -> Optional[bool]:
     t = (s or "").strip().lower()
-    if t in ["да","yes","y","ага","true","1","нужно"]:
-        return True
-    if t in ["нет","no","n","false","0","не","не нужно","не надо"]:
-        return False
+    if t in ["да","yes","y","ага","true","1","нужно"]: return True
+    if t in ["нет","no","n","false","0","не","не нужно","не надо"]: return False
     return None
 
 def build_perma(chat_id: int, message_id: int) -> str:
@@ -170,12 +149,9 @@ def build_perma(chat_id: int, message_id: int) -> str:
     return f"https://t.me/c/{private_id}/{message_id}"
 
 def listing_link(item: Dict) -> str:
-    if item.get("link"):
-        return str(item["link"])
+    if item.get("link"): return str(item["link"])
     mid = str(item.get("message_id") or "").strip()
-    if mid:
-        if CHANNEL_USERNAME:
-            return f"https://t.me/{CHANNEL_USERNAME}/{mid}"
+    if mid and CHANNEL_USERNAME: return f"https://t.me/{CHANNEL_USERNAME}/{mid}"
     return ""
 
 def format_listing(item: Dict) -> str:
@@ -184,16 +160,13 @@ def format_listing(item: Dict) -> str:
         f"Район: {item.get('area','?')}",
         f"Спален: {item.get('bedrooms','?')} | Цена: {item.get('price_thb','?')} ฿/мес",
     ]
-    if item.get("distance_to_sea_m"):
-        parts.append(f"До моря: {item['distance_to_sea_m']} м")
-    if str(item.get("pets","")).strip():
-        parts.append(f"Питомцы: {item['pets']}")
+    if item.get("distance_to_sea_m"): parts.append(f"До моря: {item['distance_to_sea_m']} м")
+    if str(item.get("pets","")).strip(): parts.append(f"Питомцы: {item['pets']}")
     link = listing_link(item)
-    if link:
-        parts.append(f"\n<a href=\"{link}\">Открыть объявление</a>")
+    if link: parts.append(f"\n<a href=\"{link}\">Открыть объявление</a>")
     return "\n".join(parts)
 
-# -------- Поиск по Listings --------
+# ========= Поиск по Listings =========
 def search_listings(area: str = "", bedrooms: int = 0, budget_thb: int = 0,
                     pets: Optional[bool] = None, limit: int = 3) -> List[Dict]:
     items = listings_all()
@@ -213,7 +186,7 @@ def search_listings(area: str = "", bedrooms: int = 0, budget_thb: int = 0,
     out.sort(key=lambda x: to_int(str(x.get("price_thb","0"))))
     return out[:max(1, min(limit, 10))]
 
-# ---------- OpenAI ----------
+# ========= OpenAI =========
 def _chat_completion(messages: List[Dict]) -> str:
     if not OPENAI_API_KEY:
         return "У меня нет доступа к OpenAI, добавьте OPENAI_API_KEY в Render → Environment."
@@ -228,36 +201,34 @@ async def ai_answer(prompt: str) -> str:
     msgs = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}]
     return await asyncio.to_thread(_chat_completion, msgs)
 
-# ---------- Preflight: мягкий сброс long-poll ----------
+# ========= Preflight (только для polling) =========
 def preflight_release_slot(token: str, attempts: int = 6):
     base = f"https://api.telegram.org/bot{token}"
 
     def _post(method, **params):
         try:
-            r = requests.post(f"{base}/{method}", params=params, timeout=10)
-            return r.status_code
+            return requests.post(f"{base}/{method}", params=params, timeout=10)
         except Exception as e:
             log.warning("%s error: %s", method, e)
             return None
 
     _post("deleteWebhook", drop_pending_updates=True)
-    _post("close")
 
     backoff = 2
     for i in range(1, attempts + 1):
-        try:
-            chk = requests.get(f"{base}/getUpdates", params={"timeout": 1}, timeout=5)
-            if chk.status_code != 409:
-                log.info("Polling slot is free (status %s).", chk.status_code)
-                return
-            log.warning("409 Conflict still present (try %d/%d)", i, attempts)
-        except Exception as e:
-            log.warning("getUpdates check error: %s", e)
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 8)
-    log.warning("Polling slot may still be busy, starting anyway…")
+        r = _post("close")
+        if r and r.ok:
+            log.info("Polling slot closed successfully."); break
+        if r and r.status_code == 429:
+            retry = int((r.json().get("parameters", {}) or {}).get("retry_after", 30))
+            log.warning("429 on close; sleep %ss", retry); time.sleep(retry); continue
+        chk = requests.get(f"{base}/getUpdates", params={"timeout": 1}, timeout=5)
+        if chk.status_code != 409:
+            log.info("Polling slot looks free (status %s).", chk.status_code); break
+        log.warning("409 Conflict still present (try %d/%d)", i, attempts)
+        time.sleep(backoff); backoff = min(backoff * 2, 8)
 
-# ---------- Парсер постов канала ----------
+# ========= Парсер постов канала =========
 AREAS = {
     "lamai":   ["lamai", "ламай"],
     "bophut":  ["bophut", "бопут", "бо пут", "бофут", "бопхут"],
@@ -274,198 +245,117 @@ def norm_area(text: str) -> Optional[str]:
     t = (text or "").lower()
     for canon, aliases in AREAS.items():
         for a in aliases:
-            if a in t:
-                return canon
+            if a in t: return canon
     return None
 
 def parse_channel_text(text: str) -> Dict[str, str]:
     data: Dict[str, str] = {}
-    if not text:
-        return data
-    if (m := LOT_RE.search(text)):
-        data["id"] = m.group(1)  # лот кладём как id
-        data["title"] = f"Лот №{m.group(1)}"
-    if (m := BED_RE.search(text)):
-        data["bedrooms"] = str(int(m.group(1)))
-    ar = norm_area(text)
-    if ar:
-        data["area"] = ar
+    if not text: return data
+    if (m := LOT_RE.search(text)): data["id"] = m.group(1); data["title"] = f"Лот №{m.group(1)}"
+    if (m := BED_RE.search(text)): data["bedrooms"] = str(int(m.group(1)))
+    if (a := norm_area(text)): data["area"] = a
     if (m := PRICE_RE.search(text)):
         p = re.sub(r"[^\d]", "", m.group(1))
-        if p:
-            data["price_thb"] = p
+        if p: data["price_thb"] = p
     return data
 
-# ---------- States ----------
+# ========= States =========
 (ASK_AREA, ASK_BEDROOMS, ASK_GUESTS, ASK_PETS, ASK_BUDGET,
  ASK_CHECKIN, ASK_CHECKOUT, ASK_TRANSFER, ASK_NAME, ASK_PHONE, ASK_REQS, DONE) = range(12)
 
-# ---------- Handlers: /start ----------
+# ========= Handlers =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Я уже тут!\n"
-        "🌴 Можете спросить меня о Самуи — подскажу и помогу.\n\n"
-        "👉 Или нажми /rent — задам несколько вопросов, сформирую заявку и предложу варианты ✨"
+        "✅ Я на связи!\n"
+        "Напишите /rent — запущу мини-опрос и предложу варианты из базы. "
+        "Можно просто: «3 дома 1 спальня ламай до 60к» — подберу из канала."
     )
 
-# ---------- Wizard /rent ----------
+# /rent диалог
 async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Начнём. Какой район Самуи предпочитаете? (Маенам, Бопут, Чавенг, Ламай)")
     return ASK_AREA
-
-async def ask_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["area"] = update.message.text.strip()
-    await update.message.reply_text("Сколько спален нужно?")
-    return ASK_BEDROOMS
-
-async def ask_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["bedrooms"] = to_int(update.message.text, 1)
-    await update.message.reply_text("Сколько гостей будет проживать?")
-    return ASK_GUESTS
-
-async def ask_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["guests"] = to_int(update.message.text, 1)
-    await update.message.reply_text("Питомцы будут? (да/нет)")
-    return ASK_PETS
-
-async def ask_pets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    yn = yes_no(update.message.text)
-    context.user_data["pets"] = yn if yn is not None else False
-    await update.message.reply_text("Какой бюджет на месяц (в батах)?")
-    return ASK_BUDGET
-
-async def ask_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["budget_thb"] = to_int(update.message.text, 0)
-    await update.message.reply_text("Дата заезда (например: 2025-09-01)?")
-    return ASK_CHECKIN
-
-async def ask_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["check_in"] = update.message.text.strip()
-    await update.message.reply_text("Дата выезда (например: 2026-03-01)?")
-    return ASK_CHECKOUT
-
-async def ask_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["check_out"] = update.message.text.strip()
-    await update.message.reply_text("Нужен ли трансфер из аэропорта? (да/нет)")
-    return ASK_TRANSFER
-
-async def ask_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["transfer"] = yes_no(update.message.text) is True
-    await update.message.reply_text("Ваше имя и фамилия?")
-    return ASK_NAME
-
-async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text("Контактный телефон (с кодом страны)?")
-    return ASK_PHONE
-
-async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("Доптребования? (вид на море, бассейн, рабочее место и т.д.)")
-    return ASK_REQS
+async def ask_area(update, context): context.user_data["area"]=update.message.text.strip(); await update.message.reply_text("Сколько спален нужно?"); return ASK_BEDROOMS
+async def ask_bedrooms(update, context): context.user_data["bedrooms"]=to_int(update.message.text,1); await update.message.reply_text("Сколько гостей будет проживать?"); return ASK_GUESTS
+async def ask_guests(update, context): context.user_data["guests"]=to_int(update.message.text,1); await update.message.reply_text("Питомцы будут? (да/нет)"); return ASK_PETS
+async def ask_pets(update, context): yn=yes_no(update.message.text); context.user_data["pets"]=yn if yn is not None else False; await update.message.reply_text("Какой бюджет на месяц (в батах)?"); return ASK_BUDGET
+async def ask_budget(update, context): context.user_data["budget_thb"]=to_int(update.message.text,0); await update.message.reply_text("Дата заезда (напр. 2025-09-01)?"); return ASK_CHECKIN
+async def ask_checkin(update, context): context.user_data["check_in"]=update.message.text.strip(); await update.message.reply_text("Дата выезда (напр. 2026-03-01)?"); return ASK_CHECKOUT
+async def ask_checkout(update, context): context.user_data["check_out"]=update.message.text.strip(); await update.message.reply_text("Нужен ли трансфер из аэропорта? (да/нет)"); return ASK_TRANSFER
+async def ask_transfer(update, context): context.user_data["transfer"]=yes_no(update.message.text) is True; await update.message.reply_text("Ваше имя и фамилия?"); return ASK_NAME
+async def ask_name(update, context): context.user_data["name"]=update.message.text.strip(); await update.message.reply_text("Контактный телефон (с кодом страны)?"); return ASK_PHONE
+async def ask_phone(update, context): context.user_data["phone"]=update.message.text.strip(); await update.message.reply_text("Доптребования? (вид на море, бассейн и т.п.)"); return ASK_REQS
 
 async def finish_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["requirements"] = update.message.text.strip()
-    area = context.user_data.get("area","")
-    bedrooms = int(context.user_data.get("bedrooms",1))
-    budget = int(context.user_data.get("budget_thb",0))
-    pets = context.user_data.get("pets", False)
+    area = context.user_data.get("area",""); bedrooms=int(context.user_data.get("bedrooms",1))
+    budget=int(context.user_data.get("budget_thb",0)); pets=context.user_data.get("pets", False)
 
     try:
         matches = search_listings(area=area, bedrooms=bedrooms, budget_thb=budget, pets=pets, limit=3)
     except Exception as e:
-        log.exception("Search listings error: %s", e)
-        matches = []
+        log.exception("Search listings error: %s", e); matches = []
 
     if matches:
-        await update.message.reply_text("Подобрал варианты из нашей базы (первые 3):")
+        await update.message.reply_text("Подобрал варианты (первые 3):")
         for it in matches:
             for chunk in chunk_text(format_listing(it)):
                 await update.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
     else:
-        await update.message.reply_text("Пока точных совпадений не нашёл. Передам менеджеру ваш запрос — он предложит индивидуальные варианты.")
+        await update.message.reply_text("Пока точных совпадений не нашёл. Передам менеджеру ваш запрос.")
 
     u = update.effective_user
-    lead = context.user_data.copy()
-    lead["listing_id"] = context.user_data.get("listing_id","")
-    lead_row = [
-        time.strftime("%Y-%m-%d %H:%M:%S"),
-        "bot",
-        lead.get("name",""),
-        lead.get("phone",""),
-        lead.get("area",""),
-        lead.get("bedrooms",""),
-        lead.get("guests",""),
-        "да" if lead.get("pets") else "нет",
-        lead.get("budget_thb",""),
-        lead.get("check_in",""),
-        lead.get("check_out",""),
-        "да" if lead.get("transfer") else "нет",
-        lead.get("requirements",""),
-        lead.get("listing_id",""),
-        str(u.id if u else ""),
-        u.username if (u and u.username) else "",
+    lead = context.user_data.copy(); lead["listing_id"] = context.user_data.get("listing_id","")
+    row = [
+        time.strftime("%Y-%m-%d %H:%M:%S"), "bot", lead.get("name",""), lead.get("phone",""),
+        lead.get("area",""), lead.get("bedrooms",""), lead.get("guests",""),
+        "да" if lead.get("pets") else "нет", lead.get("budget_thb",""),
+        lead.get("check_in",""), lead.get("check_out",""), "да" if lead.get("transfer") else "нет",
+        lead.get("requirements",""), lead.get("listing_id",""),
+        str(u.id if u else ""), u.username if (u and u.username) else "",
     ]
-    try:
-        leads_append(lead_row)
-    except Exception as e:
-        log.exception("Ошибка записи лида в Google Sheets: %s", e)
+    try: leads_append(row)
+    except Exception as e: log.exception("Sheets lead write error: %s", e)
 
     if MANAGER_CHAT_ID:
         try:
-            text = (
-                "<b>Новая заявка</b>\n"
-                f"Имя: {lead.get('name')}\nТел: {lead.get('phone')}\n"
-                f"Район: {lead.get('area')} | Спален: {lead.get('bedrooms')} | Гостей: {lead.get('guests')}\n"
-                f"Питомцы: {'да' if lead.get('pets') else 'нет'} | Бюджет: {lead.get('budget_thb')} ฿\n"
-                f"Даты: {lead.get('check_in')} → {lead.get('check_out')} | Трансфер: {'да' if lead.get('transfer') else 'нет'}\n"
-                f"Пожелания: {lead.get('requirements')}\n"
-                f"Listing ID: {lead.get('listing_id')}\n"
-                f"TG: @{u.username if (u and u.username) else u.id}"
-            )
+            text = ( "<b>Новая заявка</b>\n"
+                     f"Имя: {lead.get('name')} | Тел: {lead.get('phone')}\n"
+                     f"Район: {lead.get('area')} | Спален: {lead.get('bedrooms')} | Гостей: {lead.get('guests')}\n"
+                     f"Питомцы: {'да' if lead.get('pets') else 'нет'} | Бюджет: {lead.get('budget_thb')} ฿\n"
+                     f"Даты: {lead.get('check_in')} → {lead.get('check_out')} | Трансфер: {'да' if lead.get('transfer') else 'нет'}\n"
+                     f"Пожелания: {lead.get('requirements')}\n"
+                     f"Listing ID: {lead.get('listing_id')} | TG: @{u.username if (u and u.username) else u.id}" )
             await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
-        except Exception:
-            log.exception("Не удалось отправить уведомление менеджеру")
+        except Exception: log.exception("Notify manager failed")
 
     await update.message.reply_text("Спасибо! Заявка зафиксирована. Менеджер Cozy Asia свяжется с вами.")
     context.user_data.clear()
     return ConversationHandler.END
 
-async def cancel_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Окей, отменил.")
-    return ConversationHandler.END
+async def cancel_wizard(update, context):
+    context.user_data.clear(); await update.message.reply_text("Окей, отменил."); return ConversationHandler.END
 
-# ---------- AI fallback ----------
+# AI fallback
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
+    if not (update.message and update.message.text): return
     prompt = update.message.text.strip()
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
+    try: await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    except Exception: pass
     if re.search(r"(help|подобрать|найти|дом|вил+а|квартира|аренда)", prompt.lower()):
-        await update.message.reply_text("Могу запустить быстрый опрос и предложить варианты из базы. Напишите /rent.")
-
-    if not OPENAI_API_KEY:
-        return
+        await update.message.reply_text("Могу запустить опрос и предложить варианты из базы. Напишите /rent.")
+    if not OPENAI_API_KEY: return
     try:
         reply = await ai_answer(prompt)
-        for chunk in chunk_text(reply):
-            await update.message.reply_text(chunk)
-    except Exception as e:
-        log.exception("OpenAI error: %s", e)
+        for chunk in chunk_text(reply): await update.message.reply_text(chunk)
+    except Exception as e: log.exception("OpenAI error: %s", e)
 
-# ---------- Постинг в канал ----------
+# /post
 async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
-        await update.message.reply_text("🚫 Недостаточно прав.")
-        return
+        await update.message.reply_text("🚫 Недостаточно прав."); return
     if CHANNEL_ID is None:
-        await update.message.reply_text("❗️CHANNEL_ID не задан в Environment.")
-        return
+        await update.message.reply_text("❗️CHANNEL_ID не задан."); return
     text = " ".join(context.args).strip() or "Тест из бота 🚀"
     try:
         await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
@@ -474,61 +364,52 @@ async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Post to channel error: %s", e)
         await update.message.reply_text("Не удалось отправить в канал (см. логи).")
 
-# ---------- Индексация канала → Listings ----------
-def _extract_limit(text: str, fallback: int = 3) -> int:
-    nums = [int(n) for n in re.findall(r"\b(\d{1,2})\b", text)]
-    if nums:
-        return max(1, min(nums[-1], 10))
-    return fallback
-
+# Индексация канала → Listings
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.channel_post
-    if not m:
-        return
+    if not m: return
     text = m.text or m.caption or ""
     parsed = parse_channel_text(text)
-    if not parsed:
-        return
+    if not parsed: return
     parsed["message_id"] = str(m.message_id)
     parsed.setdefault("link", build_perma(m.chat.id, m.message_id))
     parsed.setdefault("status", "active")
     try:
-        listings_upsert_by_message(parsed, message_id=str(m.message_id))
-        log.info("Indexed channel post #%s into Listings", m.message_id)
+        listings_upsert_by_message(parsed, str(m.message_id))
     except Exception as e:
         log.exception("Listings upsert error: %s", e)
 
 async def handle_channel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.edited_channel_post
-    if not m:
-        return
+    if not m: return
     text = m.text or m.caption or ""
     parsed = parse_channel_text(text)
     parsed["message_id"] = str(m.message_id)
     parsed.setdefault("link", build_perma(m.chat.id, m.message_id))
     try:
-        listings_upsert_by_message(parsed, message_id=str(m.message_id))
-        log.info("Updated channel post #%s into Listings", m.message_id)
+        listings_upsert_by_message(parsed, str(m.message_id))
     except Exception as e:
         log.exception("Listings upsert (edit) error: %s", e)
 
-# ---------- Поиск /find и свободный запрос ----------
+# /find + свободный поиск
+def _extract_limit(text: str, fallback: int = 3) -> int:
+    nums = [int(n) for n in re.findall(r"\b(\d{1,2})\b", text)]
+    return max(1, min(nums[-1], 10)) if nums else fallback
+
 def extract_filters_free(text: str):
     t = text.lower()
     area = norm_area(t) or ""
-    beds = None
-    if (m := BED_RE.search(t)):
-        beds = int(m.group(1))
+    beds = int(BED_RE.search(t).group(1)) if BED_RE.search(t) else 0
     budget = 0
-    if (m := re.search(r"до\s*(\d{1,3}(?:[ .]?\d{3})*|\d+)\s*[кk]?", t)):
-        budget = to_int(m.group(1))
-        if re.search(r"[кk]\b", m.group(0)): budget *= 1000
-    elif (m := re.search(r"(\d{1,3}(?:[ .]?\d{3})*|\d+)\s*[кk]?\s*(?:бат|thb|฿)", t)):
-        budget = to_int(m.group(1))
-        if re.search(r"[кk]\b", m.group(0)): budget *= 1000
+    m1 = re.search(r"до\s*(\d{1,3}(?:[ .]?\d{3})*|\d+)\s*[кk]?", t)
+    m2 = re.search(r"(\d{1,3}(?:[ .]?\d{3})*|\d+)\s*[кk]?\s*(?:бат|thb|฿)", t)
+    if m1:
+        budget = to_int(m1.group(1));  budget *= 1000 if re.search(r"[кk]\b", m1.group(0)) else 0 or budget
+    elif m2:
+        budget = to_int(m2.group(1));  budget *= 1000 if re.search(r"[кk]\b", m2.group(0)) else 0 or budget
     pets = True if re.search(r"\b(питомц|pets|животн).*(да|разреш|ok|allowed)", t) else None
     limit = _extract_limit(t, 3)
-    return area, (beds or 0), budget, pets, limit
+    return area, beds, budget, pets, limit
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = " ".join(context.args) if context.args else (update.message.text or "")
@@ -536,40 +417,33 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         rows = search_listings(area=area, bedrooms=bedrooms, budget_thb=budget, pets=pets, limit=limit)
     except Exception as e:
-        log.exception("search_listings error: %s", e)
-        rows = []
+        log.exception("search_listings error: %s", e); rows = []
     if not rows:
-        await update.message.reply_text("Ничего не нашёл по этим параметрам 🙈 Уточните район/спальни/бюджет.")
-        return
+        await update.message.reply_text("Ничего не нашёл 🙈 Уточните район/спальни/бюджет."); return
     text = "Нашёл варианты:\n\n" + "\n\n".join(format_listing(r) for r in rows)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
 async def free_text_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
+    if not (update.message and update.message.text): return
     txt = update.message.text
     if norm_area(txt) or BED_RE.search(txt) or "покажи" in txt.lower() or "найди" in txt.lower():
         area, bedrooms, budget, pets, limit = extract_filters_free(txt)
         try:
             rows = search_listings(area=area, bedrooms=bedrooms, budget_thb=budget, pets=pets, limit=limit)
         except Exception as e:
-            log.exception("search_listings error: %s", e)
-            rows = []
+            log.exception("search_listings error: %s", e); rows = []
         if rows:
             text = "Подобрал варианты:\n\n" + "\n\n".join(format_listing(r) for r in rows)
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
             return
     await handle_text(update, context)
 
-# ---------- ENTRY ----------
+# ========= ENTRY =========
 def main():
-    preflight_release_slot(TOKEN)
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # /start
+    # Команды
     app.add_handler(CommandHandler("start", start))
-
-    # /rent conversation
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_entry)],
         states={
@@ -589,25 +463,37 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv)
-
-    # /find
     app.add_handler(CommandHandler("find", cmd_find))
-
-    # /post (только в личке и только админам)
     app.add_handler(CommandHandler("post", post_to_channel, filters=filters.ChatType.PRIVATE))
 
-    # Индексация канала (новые/исправленные посты)
+    # Канальные апдейты
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST, handle_channel_edit))
 
-    # Свободный текст → умный поиск → fallback к AI
+    # Свободный текст → поиск/AI
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_find))
 
-    log.info("🚀 Starting polling…")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "channel_post", "edited_channel_post"]
-    )
+    updates = ["message", "channel_post", "edited_channel_post"]
+
+    if WEBHOOK_BASE_URL:
+        # WEBHOOK mode: без getUpdates → нет 409
+        url_path = f"/telegram/{WEBHOOK_SECRET}"
+        full_url = f"{WEBHOOK_BASE_URL}{url_path}"
+        port = int(os.getenv("PORT", "8080"))
+        log.info("Starting WEBHOOK on 0.0.0.0:%s, url=%s", port, full_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path.lstrip("/"),
+            webhook_url=full_url,
+            drop_pending_updates=True,
+            allowed_updates=updates,
+        )
+    else:
+        # POLLING fallback (например, локально)
+        preflight_release_slot(TOKEN)
+        log.info("Starting POLLING…")
+        app.run_polling(drop_pending_updates=True, allowed_updates=updates)
 
 if __name__ == "__main__":
     main()
