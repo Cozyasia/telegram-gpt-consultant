@@ -44,7 +44,9 @@ LEADS_TAB = os.getenv("LEADS_TAB", "Leads")
 LISTINGS_TAB = os.getenv("LISTINGS_TAB", "Listings")
 
 # Telegram channel / admin
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()  # без '@'
+# Нормализуем имя: допускаем, что в ENV оно с '@'
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").lstrip("@").strip()
+
 MANAGER_CHAT_ID_RAW = os.getenv("MANAGER_CHAT_ID", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
@@ -72,6 +74,47 @@ SYSTEM_PROMPT = (
     "Не выдумывай; приоритет — предлагать варианты из внутренней базы (таблица Listings)."
 )
 
+# ---------- Telegram preflight (снимаем webhook и закрываем висящие getUpdates) ----------
+BASE = f"https://api.telegram.org/bot{TOKEN}"
+
+def _tg(method: str, params=None, tries: int = 6):
+    """Вызов Telegram API с автоповтором на 429/409."""
+    params = params or {}
+    for _ in range(tries):
+        r = requests.get(f"{BASE}/{method}", params=params, timeout=10)
+        data = {}
+        try:
+            data = r.json()
+        except Exception:
+            pass
+        if data.get("ok"):
+            return data
+        code = data.get("error_code")
+        if code == 429:  # flood limit
+            delay = int(data.get("parameters", {}).get("retry_after", 5)) + 1
+            log.warning("Telegram 429 retry_after=%s", delay)
+            time.sleep(delay)
+            continue
+        if code == 409:  # другой getUpdates активен
+            log.warning("Telegram 409 conflict, retrying…")
+            time.sleep(3)
+            continue
+        raise RuntimeError(f"Telegram API error {code}: {data.get('description')}")
+    raise RuntimeError("Telegram API: too many retries")
+
+def release_slot():
+    """Жёстко освобождает polling-слот: deleteWebhook + close."""
+    try:
+        _tg("deleteWebhook", {"drop_pending_updates": True})
+        log.info("deleteWebhook -> OK")
+    except Exception as e:
+        log.warning("deleteWebhook error: %s", e)
+    try:
+        _tg("close")
+        log.info("close -> OK")
+    except Exception as e:
+        log.warning("close error: %s", e)
+
 # ---------- Google Sheets ----------
 LISTING_HEADERS = [
     "id","title","area","bedrooms","price_thb","distance_to_sea_m",
@@ -96,7 +139,8 @@ def ws_get_or_create(sh, name: str, headers: List[str]):
         ws = sh.worksheet(name)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(name, rows=2000, cols=40)
-        ws.append_row(headers)
+        if headers:
+            ws.append_row(headers)
     return ws
 
 def get_ws(name: str, headers: List[str]):
@@ -418,10 +462,23 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Error writing listing: %s", e)
 
-# ---- Post to channel (админы, опционально) ----
-async def post_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Функция отключена в этой сборке.")
-    # Можно включить при необходимости: отправка в канал по /post
+# ---- Admin helpers: /sa_email и /test_sheet ----
+async def sa_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        await update.message.reply_text(info.get("client_email","<no client_email in JSON>"))
+    except Exception as e:
+        await update.message.reply_text(f"ERR: {e}")
+
+async def test_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        ws = get_ws(LEADS_TAB, LEAD_HEADERS)
+        ws.append_row([time.strftime("%Y-%m-%d %H:%M:%S"), "bot", "TEST", "0000"])
+        await update.message.reply_text("Sheets OK: строка добавлена.")
+        log.info("TEST row appended")
+    except Exception as e:
+        await update.message.reply_text(f"Sheets ERROR: {e}")
+        log.exception("Sheets append failed")
 
 # ---------- ENTRY ----------
 def main():
@@ -454,6 +511,10 @@ def main():
     # Приём постов из канала
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
 
+    # Admin helpers
+    app.add_handler(CommandHandler("sa_email", sa_email))
+    app.add_handler(CommandHandler("test_sheet", test_sheet))
+
     # AI-ответы по умолчанию
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -473,6 +534,11 @@ def main():
             allowed_updates=allowed,
         )
     else:
+        log.info("Releasing Telegram slot…")
+        try:
+            release_slot()
+        except Exception as e:
+            log.warning("release_slot failed: %s", e)
         log.info("Starting POLLING…")
         app.run_polling(allowed_updates=allowed, drop_pending_updates=True)
 
