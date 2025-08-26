@@ -1,7 +1,3 @@
-python-telegram-bot[webhooks]==21.4
-requests>=2.32.0
-gspread>=6.0.0
-google-auth>=2.30.0
-telethon>=1.33.1
-# aiohttp ставится автоматически с [webhooks], но оставить можно
-aiohttp>=3.9.5
+python-telegram-bot==21.4
+gspread==6.1.2
+google-auth==2.34.0
