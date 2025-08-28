@@ -1,6 +1,7 @@
 python-telegram-bot[webhooks]==21.6
 gspread==6.0.2
 google-auth==2.31.0
-requests==2.32.3
 cachetools==5.4.0
 oauthlib==3.2.2
+requests==2.32.3
+openai>=1.37.0
