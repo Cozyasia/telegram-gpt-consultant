@@ -51,10 +51,10 @@ PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "").lstrip("@").strip()
 
 # Приветствие по умолчанию — можно переопределить переменной GREETING_MESSAGE
 DEFAULT_GREETING = (
-    "✅ Я уже тут!
-🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.
-👉 Или нажмите команду /rent — я задам несколько вопросов о жилье, сформирую заявку, предложу варианты и передам менеджеру.
-Он свяжется с вами для уточнения деталей и бронирования."
+    "✅ Я уже тут!\n"
+    "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
+    "👉 Или нажмите команду /rent — я задам несколько вопросов о жилье, сформирую заявку, предложу варианты и передам менеджеру.\n"
+    "Он свяжется с вами для уточнения деталей и бронирования."
 )
 GREETING_MESSAGE = os.environ.get("GREETING_MESSAGE", DEFAULT_GREETING)
 
@@ -176,7 +176,7 @@ def parse_listing_from_text(text: str, msg_link: str, listing_id: str) -> Dict[s
     pets_allowed = "unknown"
     if "без питомц" in t or "no pets" in t:
         pets_allowed = "no"
-    elif "с питомц" in t or "pets ok" in t or "pet friendly" in t:
+    elif "с питомц" in t или "pets ok" in t or "pet friendly" in t:
         pets_allowed = "yes"
 
     pool = "yes" if ("pool" in t or "бассейн" in t) else "no"
@@ -277,7 +277,7 @@ async def rent_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def rent_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     m = re.search(r"\d+", update.message.text.replace(" ", ""))
-    context.user_data["budget"] = int(m.group()) if m else 0
+    context.user_data["budget"] = int(m.group()) если m else 0
     await update.message.reply_text("👨‍👩‍👧‍👦 Сколько человек будет проживать?")
     return PEOPLE
 
