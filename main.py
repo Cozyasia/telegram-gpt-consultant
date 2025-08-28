@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cozy Asia Bot — единый main.py (PTB v21)
-- Webhook (Render) ИЛИ polling локально.
-- БЕЗ ручного управления asyncio: используем блокирующие run_webhook/run_polling.
+- Webhook (Render) ИЛИ polling локально (без ручного управления asyncio).
 - GPT small talk вне опроса (/rent) — если есть OPENAI_API_KEY.
 - Анкета /rent: район → спальни → бюджет → люди → питомцы → бассейн → рабочее место → телефон → имя → пожелания.
 - Запись лида в Google Sheets (лист 'Leads'), лотов из канала — в 'Listings'.
@@ -30,7 +29,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters
@@ -50,15 +49,20 @@ BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "").lstrip("@").strip()
 
-# НОВОЕ приветствие по умолчанию
-GREETING_MESSAGE = os.environ.get(
-    "GREETING_MESSAGE",
-    "✅ Я уже тут!\n"
-    "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
-    "👉 Или нажмите команду /rent — я задам несколько вопросов о жилье, "
-    "сформирую заявку, предложу варианты и передам менеджеру.\n"
-    "Он свяжется с вами для уточнения деталей и бронирования."
+# Приветствие по умолчанию — можно переопределить переменной GREETING_MESSAGE
+DEFAULT_GREETING = (
+    "👋 Привет! Добро пожаловать в «Cosy Asia Real Estate Bot»\n\n"
+    "😊 Я твой ИИ помощник и консультант.\n"
+    "🗣️ Со мной можно говорить так же свободно, как с человеком.\n\n"
+    "❓ Задавай любые вопросы:\n"
+    "🏡 про дома, виллы и квартиры на Самуи\n"
+    "🌴 про жизнь на острове, районы и атмосферу, погоду на время пребывания\n"
+    "🍹 про быт, отдых и всё, что тебе интересно, куда сходить на острове 🏝️\n\n"
+    "✨ Я всегда рядом, чтобы найти лучшее жильё и чувствовать себя на Самуи как дома 🏖️\n"
+    "Помогу в любой момент.\n\n"
+    "👉 Или нажми /rent — задам пару вопросов, сформирую заявку и передам менеджеру."
 )
+GREETING_MESSAGE = os.environ.get("GREETING_MESSAGE", DEFAULT_GREETING)
 
 MANAGER_CHAT_ID = os.environ.get("MANAGER_CHAT_ID", "").strip() or None
 
@@ -92,7 +96,6 @@ LISTING_COLUMNS = [
 def _ensure_ws(sh, title: str, headers: List[str]):
     if title in [w.title for w in sh.worksheets()]:
         ws = sh.worksheet(title)
-        # подровняем заголовки, если лист уже был
         try:
             first_row = ws.row_values(1)
             if first_row != headers:
@@ -260,6 +263,7 @@ def gpt_reply(text: str, system_hint: str = "") -> Optional[str]:
 ) = range(10)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Покажем приветствие при /start (после нажатия пользователем кнопки "Старт")
     await update.message.reply_text(GREETING_MESSAGE)
 
 async def rent_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -410,10 +414,7 @@ async def smalltalk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if reply:
         await update.message.reply_text(reply)
     else:
-        # fallback без GPT
-        await update.message.reply_text(
-            "Я вас слышу. Можете также запустить анкету по аренде: /rent 😊"
-        )
+        await update.message.reply_text("Я вас слышу. Можете также запустить анкету по аренде: /rent 😊")
 
 # ---------- Сборка приложения ----------
 def build_application() -> Application:
