@@ -346,7 +346,7 @@ def main():
     setup_gsheets()
     app = build_app()
 
-    me = app.bot.get_me(timeout=20)
+    me = app.bot.get_me()
     log.info("Bot: @%s", me.username)
 
     allowed = ["message", "channel_post", "callback_query"]
