@@ -26,9 +26,15 @@ GREETING_TEXT = os.environ.get("GREETING_TEXT",
     "Нажми /rent — задам пару вопросов и предложу варианты из базы."
 )
 # Для webhook
+# было:
 BASE_URL = os.environ["BASE_URL"].rstrip("/")         # внешний URL Render сервиса, без слеша в конце
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/{TELEGRAM_BOT_TOKEN}")  # можно оставить как есть
-PORT = int(os.environ.get("PORT", "10000"))           # Render сам подставит PORT
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/{TELEGRAM_BOT_TOKEN}")
+PORT = int(os.environ.get("PORT", "10000"))
+
+# нужно:
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")  # может быть пустым
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/{TELEGRAM_BOT_TOKEN}")
+PORT = int(os.environ.get("PORT", "10000"))
 
 # ---------- GSPREAD ----------
 def _gspread_client():
@@ -412,15 +418,22 @@ def build_app():
 
 def main():
     app = build_app()
-    log.info("Starting webhook on %s%s", BASE_URL, WEBHOOK_PATH)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",
-        allowed_updates=["message","channel_post","callback_query"],
-        drop_pending_updates=True,
-    )
+    if BASE_URL:  # если задано — работаем через webhook
+        logging.info("Starting webhook on %s%s", BASE_URL, WEBHOOK_PATH)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",
+            allowed_updates=["message","channel_post","callback_query"],
+            drop_pending_updates=True,
+        )
+    else:         # иначе — fallback на polling (без требуемого BASE_URL)
+        logging.info("BASE_URL not set -> starting polling")
+        app.run_polling(
+            allowed_updates=["message","channel_post","callback_query"],
+            drop_pending_updates=True
+        )
 
 if __name__ == "__main__":
     main()
