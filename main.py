@@ -1,27 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Cozy Asia Bot — единый main.py
+Cozy Asia Bot — единый main.py (PTB 21.x)
 
-Работает:
-- На Render по webhook (WEB service).
-- Локально по polling (если BASE_URL не задан).
-
-Функции:
-- Снимает старые вебхуки с drop_pending_updates=True (нет 409).
-- Парсит посты канала и пишет лоты в Google Sheets (лист "Listings").
-- Ведёт длинную анкету /rent: район → спальни → бюджет → питомцы → люди → пожелания.
-- После анкеты подбирает варианты из памяти, пишет лид в лист "Leads" и шлёт менеджеру.
-
-Переменные окружения:
-  TELEGRAM_BOT_TOKEN   (обяз.)
-  BASE_URL             (для Render, например https://telegram-gpt-consultant-xxxx.onrender.com)
-  WEBHOOK_PATH         (по умолчанию /webhook)
-  PUBLIC_CHANNEL       (юзернейм канала без @, например samuirental)
-  GREETING_MESSAGE     (необяз. текст приветствия)
-  MANAGER_CHAT_ID      (необяз. число — чат менеджера)
-  GOOGLE_SHEET_ID      (если пишем в таблицу)
-  GOOGLE_CREDS_JSON    (весь JSON сервис-аккаунта)
-  LOG_LEVEL            (INFO/DEBUG и т.п.)
+Переменные окружения (точные имена):
+  TELEGRAM_BOT_TOKEN   — токен бота (обяз.)
+  BASE_URL             — внешний URL Render без слеша на конце (напр. https://your-app.onrender.com)
+  WEBHOOK_PATH         — путь вебхука, по умолчанию /webhook
+  PUBLIC_CHANNEL       — юзернейм канала без @ (напр. samuirental)
+  GREETING_MESSAGE     — приветствие (необяз.)
+  MANAGER_CHAT_ID      — chat_id менеджера (целое число, можно 0/пусто)
+  GOOGLE_SHEET_ID      — ID таблицы (если хотим писать в Sheets)
+  GOOGLE_CREDS_JSON    — JSON сервис-аккаунта (целиком, одной строкой)
+  LOG_LEVEL            — INFO/DEBUG/…
 """
 
 import os
@@ -30,7 +20,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from telegram import Update, Bot
 from telegram.ext import (
@@ -52,8 +42,8 @@ logging.basicConfig(
 log = logging.getLogger("cozy_bot")
 
 # ---------- ENV ----------
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]                   # обязательна
-BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")      # пусто => локальный polling
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")            # пусто => локальный polling
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "").lstrip("@").strip()
 
@@ -62,107 +52,109 @@ GREETING_MESSAGE = os.environ.get(
     "Привет! Я ассистент Cozy Asia 🌴\nНапиши, что ищешь (район, бюджет, спальни, с питомцами и т.д.) "
     "или нажми /rent — подберу варианты из базы.",
 )
-MANAGER_CHAT_ID = os.environ.get("MANAGER_CHAT_ID", "").strip() or None
+
+MANAGER_CHAT_ID: Optional[int]
+_man = os.environ.get("MANAGER_CHAT_ID", "").strip()
+MANAGER_CHAT_ID = int(_man) if _man.isdigit() else None
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
 
 # ---------- Google Sheets (опционально) ----------
 gspread = None
-sheet_works = False
-
-worksheet_listings = None     # лист с лотами (из канала)
-worksheet_leads = None        # лист с лидами (анкеты пользователей)
+sheet_ok = False
+ws_listings = None
+ws_requests = None
 
 LISTINGS_SHEET_NAME = "Listings"
-LEADS_SHEET_NAME = "Leads"
-
-LISTING_COLUMNS = [
+LISTINGS_COLS = [
     "listing_id", "created_at", "title", "description", "location", "bedrooms",
     "bathrooms", "price_month", "pets_allowed", "utilities", "electricity_rate",
     "water_rate", "area_m2", "pool", "furnished", "link", "images", "tags", "raw_text"
 ]
 
-LEAD_COLUMNS = [
-    "timestamp", "user_id", "username", "area", "bedrooms", "budget",
-    "pets", "people", "notes", "matched_count"
+REQUESTS_SHEET_NAME = "Requests"
+REQUESTS_COLS = [
+    "request_id", "created_at", "user_id", "username",
+    "area", "bedrooms", "budget", "pets", "guests", "notes", "matched_count"
 ]
 
-def setup_gsheets_if_possible() -> None:
-    """Подключение к Google Sheets, если заданы GOOGLE_SHEET_ID и GOOGLE_CREDS_JSON."""
-    global gspread, sheet_works, worksheet_listings, worksheet_leads
-    if not GOOGLE_SHEET_ID or not GOOGLE_CREDS_JSON:
+def setup_gsheets() -> None:
+    """Подключаемся к Google Sheets, если заданы переменные."""
+    global gspread, sheet_ok, ws_listings, ws_requests
+    if not (GOOGLE_SHEET_ID and GOOGLE_CREDS_JSON):
         log.info("Google Sheets не настроен — переменные не заданы.")
         return
     try:
         import gspread  # type: ignore
         from google.oauth2.service_account import Credentials  # type: ignore
 
-        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        creds = json.loads(GOOGLE_CREDS_JSON)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        sh = client.open_by_key(GOOGLE_SHEET_ID)
+        gc = gspread.authorize(
+            Credentials.from_service_account_info(creds, scopes=scopes)
+        )
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
 
         # Listings
-        if LISTINGS_SHEET_NAME in [w.title for w in sh.worksheets()]:
-            worksheet_listings = sh.worksheet(LISTINGS_SHEET_NAME)
+        titles = [w.title for w in sh.worksheets()]
+        if LISTINGS_SHEET_NAME in titles:
+            ws_listings = sh.worksheet(LISTINGS_SHEET_NAME)
         else:
-            worksheet_listings = sh.add_worksheet(title=LISTINGS_SHEET_NAME, rows="2000", cols=str(len(LISTING_COLUMNS)))
-            worksheet_listings.append_row(LISTING_COLUMNS)
+            ws_listings = sh.add_worksheet(
+                title=LISTINGS_SHEET_NAME, rows="1000", cols=str(len(LISTINGS_COLS))
+            )
+            ws_listings.append_row(LISTINGS_COLS)
 
-        # Leads
-        if LEADS_SHEET_NAME in [w.title for w in sh.worksheets()]:
-            worksheet_leads = sh.worksheet(LEADS_SHEET_NAME)
+        # Requests
+        titles = [w.title for w in sh.worksheets()]
+        if REQUESTS_SHEET_NAME in titles:
+            ws_requests = sh.worksheet(REQUESTS_SHEET_NAME)
         else:
-            worksheet_leads = sh.add_worksheet(title=LEADS_SHEET_NAME, rows="8000", cols=str(len(LEAD_COLUMNS)))
-            worksheet_leads.append_row(LEAD_COLUMNS)
+            ws_requests = sh.add_worksheet(
+                title=REQUESTS_SHEET_NAME, rows="1000", cols=str(len(REQUESTS_COLS))
+            )
+            ws_requests.append_row(REQUESTS_COLS)
 
-        sheet_works = True
-        log.info("Google Sheets подключен: листы %s и %s", LISTINGS_SHEET_NAME, LEADS_SHEET_NAME)
+        sheet_ok = True
+        log.info("Google Sheets подключен: листы '%s' и '%s'.", LISTINGS_SHEET_NAME, REQUESTS_SHEET_NAME)
     except Exception as e:
+        sheet_ok = False
         log.exception("Не удалось подключиться к Google Sheets: %s", e)
-        sheet_works = False
 
-# В памяти держим лоты (для быстрых рекомендаций)
+def append_listings_row(row: Dict[str, Any]) -> None:
+    """Запись лота в лист Listings + в память."""
+    IN_MEMORY_LISTINGS.append(row)
+    if sheet_ok and ws_listings:
+        try:
+            ws_listings.append_row([row.get(c, "") for c in LISTINGS_COLS], value_input_option="USER_ENTERED")
+        except Exception as e:
+            log.warning("Не удалось записать лот в Sheets: %s", e)
+
+def append_request_row(row: Dict[str, Any]) -> None:
+    """Запись заявки в лист Requests."""
+    if sheet_ok and ws_requests:
+        try:
+            ws_requests.append_row([row.get(c, "") for c in REQUESTS_COLS], value_input_option="USER_ENTERED")
+        except Exception as e:
+            log.warning("Не удалось записать заявку в Sheets: %s", e)
+
+# ---------- Память с лотами ----------
 IN_MEMORY_LISTINGS: List[Dict[str, Any]] = []
 
-def append_listing_row(row: Dict[str, Any]) -> None:
-    """Записывает лот в таблицу и добавляет в память."""
-    global worksheet_listings, sheet_works
-    IN_MEMORY_LISTINGS.append(row)
-    if not sheet_works or worksheet_listings is None:
-        return
-    try:
-        values = [row.get(col, "") for col in LISTING_COLUMNS]
-        worksheet_listings.append_row(values, value_input_option="USER_ENTERED")
-    except Exception as e:
-        log.exception("Ошибка записи в Google Sheets (Listings): %s", e)
-
-def append_lead_row(row: Dict[str, Any]) -> None:
-    """Записывает лид (результаты анкеты) в таблицу Leads."""
-    global worksheet_leads, sheet_works
-    if not sheet_works or worksheet_leads is None:
-        return
-    try:
-        values = [row.get(col, "") for col in LEAD_COLUMNS]
-        worksheet_leads.append_row(values, value_input_option="USER_ENTERED")
-    except Exception as e:
-        log.exception("Ошибка записи в Google Sheets (Leads): %s", e)
-
-# ---------- Парсер постов канала ----------
+# ---------- Парсер постов из канала ----------
 REGION_WORDS = [
-    "lamai", "lamaï", "lamay", "ламай",
-    "bophut", "bo phut", "бопхут",
-    "chaweng", "чавенг",
-    "maenam", "маенам",
-    "ban rak", "bangrak", "bang rak", "банрак", "банграк",
-    "choeng mon", "чоенг мон", "чоэнг мон",
-    "lipanoi", "lipa noi", "липа ной",
-    "taling ngam", "талинг ньгам", "талиннгам"
+    "lamai","lamaï","lamay","ламай",
+    "bophut","bo phut","бопхут",
+    "chaweng","чавенг",
+    "maenam","маенам",
+    "ban rak","bangrak","bang rak","банрак","банграк",
+    "choeng mon","чоенг мон","чоэнг мон",
+    "lipa noi","lipanoi","липа ной",
+    "taling ngam","талинг ньгам","талиннгам"
 ]
 
-def parse_listing_from_text(text: str, msg_link: str, listing_id: str) -> Dict[str, Any]:
+def parse_listing_text(text: str, msg_link: str, listing_id: str) -> Dict[str, Any]:
     t = text.lower()
 
     # location
@@ -184,24 +176,18 @@ def parse_listing_from_text(text: str, msg_link: str, listing_id: str) -> Dict[s
     if mb:
         bathrooms = mb.group(1)
 
-    # price per month
+    # monthly price
     price = ""
-    mp = re.search(r"(\d[\d\s]{3,})(?:\s*baht|\s*бат|\s*฿|b|thb)?", t)
+    mp = re.search(r"(\d[\d\s]{3,})(?:\s*(?:baht|бат|฿|b|thb))?", t)
     if mp:
-        raw = mp.group(1)
-        price = re.sub(r"\s", "", raw)
+        price = re.sub(r"\s+", "", mp.group(1))
 
-    # pets
-    pets_allowed = "unknown"
+    pets = "unknown"
     if "без питомц" in t or "no pets" in t:
-        pets_allowed = "no"
+        pets = "no"
     elif "с питомц" in t or "pets ok" in t or "pet friendly" in t:
-        pets_allowed = "yes"
+        pets = "yes"
 
-    # utilities
-    utilities = "unknown"
-
-    # pool/furnished
     pool = "yes" if ("pool" in t or "бассейн" in t) else "no"
     furnished = "yes" if ("furnished" in t or "мебел" in t) else "unknown"
 
@@ -210,7 +196,7 @@ def parse_listing_from_text(text: str, msg_link: str, listing_id: str) -> Dict[s
     if mt:
         title = mt.group(1)
 
-    row = {
+    return {
         "listing_id": listing_id,
         "created_at": datetime.utcnow().isoformat(timespec="seconds"),
         "title": title,
@@ -219,8 +205,8 @@ def parse_listing_from_text(text: str, msg_link: str, listing_id: str) -> Dict[s
         "bedrooms": bedrooms,
         "bathrooms": bathrooms,
         "price_month": price,
-        "pets_allowed": pets_allowed,
-        "utilities": utilities,
+        "pets_allowed": pets,
+        "utilities": "unknown",
         "electricity_rate": "",
         "water_rate": "",
         "area_m2": "",
@@ -231,260 +217,209 @@ def parse_listing_from_text(text: str, msg_link: str, listing_id: str) -> Dict[s
         "tags": "",
         "raw_text": text,
     }
-    return row
 
-# ---------- Поиск подходящих лотов ----------
+# ---------- Подбор вариантов ----------
 def suggest_listings(area: str, bedrooms: int, budget: int) -> List[Dict[str, Any]]:
-    area_l = area.lower().strip()
+    area_l = (area or "").lower().strip()
     res: List[Dict[str, Any]] = []
-    for item in IN_MEMORY_LISTINGS:
-        ok_area = (area_l in (item.get("location") or "").lower()) if area_l else True
+    for it in IN_MEMORY_LISTINGS:
+        ok_area = True if not area_l else area_l in (it.get("location") or "").lower()
         try:
-            bd = int(item.get("bedrooms") or 0)
+            bd = int(it.get("bedrooms") or 0)
         except Exception:
             bd = 0
         try:
-            pr = int(item.get("price_month") or 0)
+            pr = int(it.get("price_month") or 0)
         except Exception:
             pr = 0
-        if ok_area and (bd >= bedrooms or bd == 0) and (pr <= budget or pr == 0):
-            res.append(item)
-    # цену None/0 в конец
-    res.sort(key=lambda x: int(x.get("price_month") or "99999999"))
+        if ok_area and (bd >= bedrooms or bd == 0) and (budget == 0 or pr == 0 or pr <= budget):
+            res.append(it)
+    res.sort(key=lambda x: int(x.get("price_month") or 10**9))
     return res[:5]
 
-# ---------- Анкета ----------
-AREA, BEDROOMS, BUDGET, PETS, PEOPLE, NOTES = range(6)
+# ---------- Диалог /rent ----------
+AREA, BEDROOMS, BUDGET, PETS, GUESTS, NOTES = range(6)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(GREETING_MESSAGE)
 
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Ок, отменил. Если что — /rent для нового запроса.")
+    return ConversationHandler.END
+
 async def rent_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Начнём. Какой район Самуи предпочитаете? (например: Маенам, Бопхут, Чавенг, Ламай)")
+    await update.message.reply_text(
+        "Начнём. Какой район Самуи предпочитаете? (например: Маенам, Бопхут, Чавенг, Ламай)"
+    )
     return AREA
 
 async def rent_area(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["area"] = update.message.text.strip()
+    context.user_data["area"] = (update.message.text or "").strip()
     await update.message.reply_text("Сколько спален нужно?")
     return BEDROOMS
 
 async def rent_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip()
-    m = re.search(r"\d+", txt)
-    bedrooms = int(m.group(0)) if m else 1
-    context.user_data["bedrooms"] = bedrooms
+    m = re.search(r"\d+", (update.message.text or ""))
+    context.user_data["bedrooms"] = int(m.group()) if m else 1
     await update.message.reply_text("Какой бюджет в месяц (бат)?")
     return BUDGET
 
 async def rent_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip().replace(" ", "")
-    m = re.search(r"\d+", txt)
-    budget = int(m.group(0)) if m else 0
-    context.user_data["budget"] = budget
-    await update.message.reply_text("С питомцами или без? (да/нет/без разницы)")
+    s = (update.message.text or "").replace(" ", "")
+    m = re.search(r"\d+", s)
+    context.user_data["budget"] = int(m.group()) if m else 0
+    await update.message.reply_text("С питомцами? (да/нет)")
     return PETS
 
 async def rent_pets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip().lower()
-    if "да" in txt or "yes" in txt:
-        pets = "yes"
-    elif "нет" in txt or "no" in txt:
-        pets = "no"
-    else:
-        pets = "any"
-    context.user_data["pets"] = pets
+    txt = (update.message.text or "").strip().lower()
+    context.user_data["pets"] = "yes" if txt in ("да","yes","y","+") else ("no" if txt in ("нет","no","n","-") else "unknown")
     await update.message.reply_text("Сколько человек будет проживать?")
-    return PEOPLE
+    return GUESTS
 
-async def rent_people(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip()
-    m = re.search(r"\d+", txt)
-    people = int(m.group(0)) if m else 1
-    context.user_data["people"] = people
-    await update.message.reply_text("Есть спецпожелания? Напишите текстом или отправьте '-' если нет.")
+async def rent_guests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    m = re.search(r"\d+", (update.message.text or ""))
+    context.user_data["guests"] = int(m.group()) if m else 1
+    await update.message.reply_text("Есть ли особые пожелания? (например: бассейн, вид на море, рядом с школой).")
     return NOTES
 
 async def rent_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    notes = update.message.text.strip()
-    if notes == "-":
-        notes = ""
-    context.user_data["notes"] = notes
-    return await finalize_rent(update, context)
+    context.user_data["notes"] = (update.message.text or "").strip()
 
-async def finalize_rent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Финализируем анкету: делаем подбор, пишем лид в таблицу, уведомляем менеджера."""
-    area = context.user_data.get("area", "")
-    bedrooms = int(context.user_data.get("bedrooms", 1))
-    budget = int(context.user_data.get("budget", 0))
-    pets = context.user_data.get("pets", "any")
-    people = int(context.user_data.get("people", 1))
-    notes = context.user_data.get("notes", "")
+    # Итоги
+    area = context.user_data.get("area","")
+    bedrooms = int(context.user_data.get("bedrooms",1))
+    budget = int(context.user_data.get("budget",0))
+    pets = context.user_data.get("pets","unknown")
+    guests = int(context.user_data.get("guests",1))
+    notes = context.user_data.get("notes","")
 
     # Подбор
     offers = suggest_listings(area, bedrooms, budget)
-    matched_count = len(offers)
 
+    # Ответ пользователю
     if offers:
         lines = ["Нашёл подходящие варианты:"]
         for o in offers:
             line = (
-                f"• {o.get('title') or 'Лот'} — спальни: {o.get('bedrooms') or '?'}; "
-                f"цена: {o.get('price_month') or '?'}; район: {o.get('location') or '?'}\n"
+                f"• {o.get('title') or 'Лот'} — спален: {o.get('bedrooms') or '?'}, "
+                f"цена: {o.get('price_month') or '?'}, район: {o.get('location') or '?'}\n"
                 f"{o.get('link') or ''}"
             )
             lines.append(line)
         await update.message.reply_text("\n\n".join(lines))
     else:
-        await update.message.reply_text("Пока ничего не нашёл в базе по этим критериям. Я передам заявку менеджеру.")
+        await update.message.reply_text("Пока ничего не нашёл по этим критериям. Я передам заявку менеджеру.")
 
-    # Запись лида в Google Sheets
-    try:
-        lead_row = {
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
-            "user_id": str(update.effective_user.id if update.effective_user else ""),
-            "username": (update.effective_user.username if update.effective_user and update.effective_user.username else ""),
-            "area": area,
-            "bedrooms": str(bedrooms),
-            "budget": str(budget),
-            "pets": pets,
-            "people": str(people),
-            "notes": notes,
-            "matched_count": str(matched_count),
-        }
-        append_lead_row(lead_row)
-    except Exception as e:
-        log.warning("Не удалось записать лид: %s", e)
+    # Запись в Requests
+    req_row = {
+        "request_id": f"{update.effective_user.id}_{int(datetime.utcnow().timestamp())}",
+        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "user_id": update.effective_user.id if update.effective_user else "",
+        "username": (update.effective_user.username if update.effective_user else "") or "",
+        "area": area, "bedrooms": bedrooms, "budget": budget,
+        "pets": pets, "guests": guests, "notes": notes,
+        "matched_count": len(offers),
+    }
+    append_request_row(req_row)
 
     # Уведомление менеджеру
     if MANAGER_CHAT_ID:
         try:
             text = (
-                "Новый лид:\n"
-                f"• Район: {area}\n"
-                f"• Спальни: {bedrooms}\n"
-                f"• Бюджет: {budget}\n"
-                f"• Питомцы: {pets}\n"
-                f"• Человек: {people}\n"
-                f"• Пожелания: {notes}\n"
-                f"• Совпадений: {matched_count}\n"
-                f"• От: @{update.effective_user.username if update.effective_user and update.effective_user.username else update.effective_user.id}"
+                "Новая заявка:\n"
+                f"Район: {area}\nСпален: {bedrooms}\nБюджет: {budget}\nПитомцы: {pets}\n"
+                f"Жильцы: {guests}\nПожелания: {notes}\n"
+                f"Пользователь: @{(update.effective_user.username or '—')}"
             )
-            await context.bot.send_message(chat_id=int(MANAGER_CHAT_ID), text=text)
+            await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=text)
         except Exception as e:
             log.warning("Не удалось отправить менеджеру: %s", e)
 
     await update.message.reply_text("Спасибо! Если хотите, можем уточнить детали или начать заново: /rent")
     return ConversationHandler.END
 
-async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Ок, отменил. Напишите /rent когда будете готовы.")
-    return ConversationHandler.END
-
 # ---------- Посты канала ----------
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.channel_post:
-        return
     msg = update.channel_post
+    if not msg:
+        return
+
     uname = (msg.chat.username or "").lower()
     if PUBLIC_CHANNEL and uname != PUBLIC_CHANNEL.lower():
-        return
+        return  # не наш канал
 
     text = (msg.text or msg.caption or "").strip()
     if not text:
         return
 
-    # ссылка на пост
-    if getattr(msg, "link", None):
-        message_link = msg.link
-    elif msg.chat.username:
-        message_link = f"https://t.me/{msg.chat.username}/{msg.message_id}"
+    # Ссылка на сообщение
+    if msg.chat.username:
+        link = f"https://t.me/{msg.chat.username}/{msg.message_id}"
     else:
-        message_link = ""
+        link = ""
 
     listing_id = f"{msg.chat.id}_{msg.message_id}"
-    item = parse_listing_from_text(text, message_link, listing_id)
-    append_listing_row(item)
+    row = parse_listing_text(text, link, listing_id)
+    append_listings_row(row)
     log.info("Сохранён лот %s из канала @%s", listing_id, msg.chat.username)
 
 # ---------- Сборка приложения ----------
-def build_application() -> Application:
-    app: Application = ApplicationBuilder().token(TOKEN).build()
+def make_app() -> Application:
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    # Команды
-    app.add_handler(CommandHandler("start", start_cmd))
+    # /start, /rent, /cancel
+    app.add_handler(CommandHandler("start", cmd_start))
 
-    # Анкета
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_start)],
         states={
-            AREA:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_area)],
-            BEDROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_bedrooms)],
-            BUDGET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_budget)],
-            PETS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_pets)],
-            PEOPLE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_people)],
-            NOTES:    [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_notes)],
+            AREA:      [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, rent_area)],
+            BEDROOMS:  [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, rent_bedrooms)],
+            BUDGET:    [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, rent_budget)],
+            PETS:      [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, rent_pets)],
+            GUESTS:    [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, rent_guests)],
+            NOTES:     [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, rent_notes)],
         },
-        fallbacks=[CommandHandler("cancel", rent_cancel)],
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
         allow_reentry=True,
     )
     app.add_handler(conv)
 
     # Посты канала
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.ALL, on_channel_post))
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & (filters.TEXT | filters.CAPTION), on_channel_post))
 
     return app
 
 # ---------- Режимы запуска ----------
 async def run_webhook(app: Application) -> None:
-    """Запуск в режиме webhook (Render)."""
-    bot: Bot = app.bot
-
-    # Снимаем старый вебхук и чистим очереди
-    await bot.delete_webhook(drop_pending_updates=True)
-    log.info("deleteWebhook -> OK")
-
+    """Запуск на Render (вебхук). Никаких ручных манипуляций с loop."""
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH if WEBHOOK_PATH.startswith('/') else '/'+WEBHOOK_PATH}"
-    await bot.set_webhook(url=webhook_url, allowed_updates=["message", "channel_post", "callback_query"])
-    log.info("setWebhook -> %s", webhook_url)
+    port = int(os.environ.get("PORT", "10000"))
 
-    # Явно убедимся, что есть event loop (Py 3.12/3.13)
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    if loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    log.info("Starting webhook at %s (PORT=%s)", webhook_url, port)
 
     await app.run_webhook(
         listen="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
+        port=port,
         url_path=WEBHOOK_PATH.lstrip("/"),
         webhook_url=webhook_url,
-        allowed_updates=["message", "channel_post", "callback_query"],
+        allowed_updates=("message", "channel_post", "callback_query"),
+        drop_pending_updates=True,   # чистим очередь и избегаем 409
     )
 
 async def run_polling(app: Application) -> None:
-    """Локальный запуск polling (когда BASE_URL не задан)."""
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    log.info("deleteWebhook -> OK (polling mode)")
-    await app.initialize()
-    await app.start()
-    log.info("Polling started…")
-    try:
-        # Используем updater для совместимости с PTB 21.x
-        await app.updater.start_polling(allowed_updates=["message", "channel_post", "callback_query"])
-        await app.updater.wait()
-    finally:
-        await app.stop()
-        await app.shutdown()
+    """Локальный запуск (polling)."""
+    await app.run_polling(
+        allowed_updates=("message", "channel_post", "callback_query"),
+        drop_pending_updates=True,
+    )
 
 def main() -> None:
-    setup_gsheets_if_possible()
-    app = build_application()
+    setup_gsheets()
+    app = make_app()
 
-    async def _run() -> None:
+    async def _run():
         me = await app.bot.get_me()
         log.info("Bot started: @%s", me.username)
         if BASE_URL:
@@ -492,17 +427,8 @@ def main() -> None:
         else:
             await run_polling(app)
 
-    # Надёжный запуск корутин с явным циклом
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    if loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    loop.run_until_complete(_run())
+    # Современный и безопасный запуск без ручного закрытия loop
+    asyncio.run(_run())
 
 if __name__ == "__main__":
     main()
