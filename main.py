@@ -1,9 +1,8 @@
-# main.py — Cozy Asia Bot (polling без Render трюков)
+# main.py — Cozy Asia Bot (Render Webhook, PTB v21)
 import os, json, re, logging, time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
-import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,7 +10,6 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters
 )
-from telegram.error import Conflict
 
 # ---------- LOG ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -21,15 +19,21 @@ log = logging.getLogger("cozyasia-bot")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GOOGLE_SHEETS_DB_ID = os.environ["GOOGLE_SHEETS_DB_ID"]
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # опционально
+PUBLIC_CHANNEL_USERNAME = os.environ.get("PUBLIC_CHANNEL_USERNAME", "").lstrip("@")
 MANAGER_CHAT_ID = int(os.environ.get("MANAGER_CHAT_ID", "0"))
-PUBLIC_CHANNEL_USERNAME = os.environ.get("PUBLIC_CHANNEL_USERNAME", "").lstrip("@")  # без @
+GREETING_TEXT = os.environ.get("GREETING_TEXT",
+    "✅ Я уже тут!\n🌴 Могу помочь с проживанием на Самуи.\n"
+    "Нажми /rent — задам пару вопросов и предложу варианты из базы."
+)
+# Для webhook
+BASE_URL = os.environ["BASE_URL"].rstrip("/")         # внешний URL Render сервиса, без слеша в конце
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/{TELEGRAM_BOT_TOKEN}")  # можно оставить как есть
+PORT = int(os.environ.get("PORT", "10000"))           # Render сам подставит PORT
 
 # ---------- GSPREAD ----------
 def _gspread_client():
-    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     creds = Credentials.from_service_account_info(
-        creds_dict,
+        json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
         scopes=["https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive"]
     )
@@ -49,13 +53,12 @@ def _get_ws_prefer(names: List[str]):
 def _ensure_ws_exact(name: str, header: List[str]):
     ws = _get_ws_prefer([name, name.lower(), name.upper(), name.capitalize()])
     if ws is None:
-        ws = sh.add_worksheet(title=name, rows="2000", cols=str(len(header) + 5))
+        ws = sh.add_worksheet(title=name, rows="2000", cols=str(len(header)+5))
         ws.append_row(header)
     elif not ws.row_values(1):
         ws.append_row(header)
     return ws
 
-# ---------- SHEETS SCHEMA ----------
 WS_LISTINGS_HDR = [
     "listing_id","created_at","title","description","location","bedrooms","bathrooms",
     "price_month","pets_allowed","utilities","electricity_rate","water_rate",
@@ -69,82 +72,67 @@ WS_LEADS_HDR = [
 ws_listings = _ensure_ws_exact("Listings", WS_LISTINGS_HDR)
 ws_leads    = _ensure_ws_exact("Leads",    WS_LEADS_HDR)
 
-# ---------- UTILS ----------
-def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+# ---------- PARSERS ----------
+AREA_WORDS = {
+    "lamai": ["ламай","ламаи","lamai","lamay"],
+    "bophut": ["бофут","bophut","fisherman"],
+    "chaweng": ["чавенг","chaweng"],
+    "maenam": ["маенам","maenam"],
+    "bangrak": ["банграк","bangrak"],
+    "choengmon": ["чонгмон","чоенгмон","choeng mon","choengmon"],
+    "lipanoi": ["липаной","lipa noi","lipanoi"],
+    "nathon": ["натон","nathon"],
+}
 
-def tme_link_for_message(chat_id: int, message_id: int) -> str:
-    if PUBLIC_CHANNEL_USERNAME:
-        return f"https://t.me/{PUBLIC_CHANNEL_USERNAME}/{message_id}"
-    abs_id = str(chat_id).replace("-100", "")
-    return f"https://t.me/c/{abs_id}/{message_id}"
-
-def parse_num(text: str) -> Optional[int]:
-    m = re.search(r"(\d[\d\s'.,]{2,})", text.replace("\u202f", " "))
+def parse_num(s: str) -> Optional[int]:
+    import re
+    m = re.search(r"(\d[\d\s'.,]{2,})", s.replace("\u202f"," "))
     if not m: return None
     raw = m.group(1).replace(" ", "").replace("'", "").replace(",", "")
     try: return int(float(raw))
     except: return None
 
-AREA_WORDS = {
-    "lamai": ["ламай","lamai"], "bophut": ["бофут","bophut","fisherman"],
-    "chaweng": ["чавенг","chaweng"], "maenam":["маенам","maenam"],
-    "bangrak":["банграк","bangrak"], "choengmon":["чонгмон","чоенгмон","choeng mon","choengmon"],
-    "lipanoi":["липаной","lipa noi","lipanoi"], "nathon":["натон","nathon"],
-}
-def extract_location(text: str) -> str:
-    t = text.lower()
-    for key, vs in AREA_WORDS.items():
-        if any(v in t for v in vs): return key
+def extract_location(t: str) -> str:
+    t = t.lower()
+    for k, vs in AREA_WORDS.items():
+        if any(v in t for v in vs): return k
     return ""
 
-def extract_bedrooms(text: str) -> Optional[int]:
-    m = re.search(r"(\d+)\s*(спальн|спальни|сп|br|bed|bedrooms?)", text.lower())
+def extract_bedrooms(t: str) -> Optional[int]:
+    import re
+    m = re.search(r"(\d+)\s*(спальн|спальни|сп|br|bed|bedrooms?)", t.lower())
     return int(m.group(1)) if m else None
 
-def extract_bathrooms(text: str) -> Optional[int]:
-    m = re.search(r"(\d+)\s*(сануз|bath|bathrooms?)", text.lower())
+def extract_bathrooms(t: str) -> Optional[int]:
+    import re
+    m = re.search(r"(\d+)\s*(сануз|bath|bathrooms?)", t.lower())
     return int(m.group(1)) if m else None
 
-def extract_price_month(text: str) -> Optional[int]:
-    t = text.lower().replace("к","000")
-    if any(x in t for x in ["бат","thb","฿","/мес","/month"]): return parse_num(t)
-    return parse_num(t)
+def extract_price_month(t: str) -> Optional[int]:
+    t2 = t.lower().replace("к","000")
+    if any(x in t2 for x in ["бат","thb","฿","/мес","/month"]): return parse_num(t2)
+    return parse_num(t2)
 
-def extract_pets(text: str) -> str:
-    t = text.lower()
+def extract_pets(t: str) -> str:
+    t = t.lower()
     if "без животных" in t or "no pets" in t: return "FALSE"
     if "с питомц" in t or "pets ok" in t or "pets allowed" in t: return "TRUE"
     return "UNKNOWN"
 
-def extract_rates(text: str) -> Tuple[Optional[float], Optional[float]]:
+def extract_rates(t: str) -> Tuple[Optional[float], Optional[float]]:
+    import re
     el = water = None
-    m1 = re.search(r"(\d+(?:[.,]\d+)?)\s*бат.?/?\s*квт", text.lower())
-    if m1: el = float(m1.group(1).replace(",","."))
-    m2 = re.search(r"(\d+(?:[.,]\d+)?)\s*бат.?/?\s*м3", text.lower())
-    if m2: water = float(m2.group(1).replace(",","."))
+    m1 = re.search(r"(\d+(?:[.,]\d+)?)\s*бат.?/?\s*квт", t.lower())
+    if m1: el = float(m1.group(1).replace(",", "."))
+    m2 = re.search(r"(\d+(?:[.,]\d+)?)\s*бат.?/?\s*м3", t.lower())
+    if m2: water = float(m2.group(1).replace(",", "."))
     return el, water
 
-def llm_extract(text: str) -> Dict[str, Any]:
-    if not OPENAI_API_KEY: return {}
-    try:
-        import openai
-        openai.api_key = OPENAI_API_KEY
-        sys = ("Извлеки параметры аренды Самуи. Верни JSON: "
-               "title, location, bedrooms, bathrooms, price_month, "
-               "pets_allowed(TRUE/FALSE/UNKNOWN), utilities, electricity_rate, "
-               "water_rate, area_m2, pool(TRUE/FALSE/UNKNOWN), furnished(TRUE/FALSE/UNKNOWN), tags[].")
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},{"role":"user","content":text}],
-            temperature=0
-        )
-        j = resp["choices"][0]["message"]["content"].strip()
-        j = re.sub(r"^```json|```$", "", j, flags=re.MULTILINE).strip()
-        return json.loads(j)
-    except Exception as e:
-        log.warning("LLM extract fail: %s", e)
-        return {}
+def tme_link(chat_id: int, msg_id: int) -> str:
+    if PUBLIC_CHANNEL_USERNAME:
+        return f"https://t.me/{PUBLIC_CHANNEL_USERNAME}/{msg_id}"
+    abs_id = str(chat_id).replace("-100", "")
+    return f"https://t.me/c/{abs_id}/{msg_id}"
 
 # ---------- SHEETS OPS ----------
 def listings_all() -> List[Dict[str,Any]]:
@@ -166,7 +154,8 @@ def append_listing(row: Dict[str,Any]):
 def append_lead(row: Dict[str,Any]) -> str:
     lead_id = f"L{int(time.time())}"
     ws_leads.append_row([
-        lead_id, now_iso(), row.get("user_id",""), row.get("username",""),
+        lead_id, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        row.get("user_id",""), row.get("username",""),
         row.get("query_text",""), row.get("location_pref",""),
         row.get("budget_min",""), row.get("budget_max",""),
         row.get("bedrooms",""), row.get("pets",""), row.get("dates",""),
@@ -199,7 +188,7 @@ def match_by_criteria(criteria: Dict[str,Any], items: List[Dict[str,Any]], top_k
             if br >= br_need: score += 0.2
             it["_score"] = score
             out.append(it)
-        except:  # noqa
+        except:
             pass
     out.sort(key=lambda x: x.get("_score",0), reverse=True)
     return out[:top_k]
@@ -208,10 +197,7 @@ def match_by_criteria(criteria: Dict[str,Any], items: List[Dict[str,Any]], top_k
 ASK_LOC, ASK_BUDGET, ASK_BEDS, ASK_PETS, ASK_DATES = range(5)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я ассистент Cozy Asia 🏝️\n"
-        "Напиши, что ищешь (район, бюджет, спальни, с питомцами и т.д.) или нажми /rent — подберу варианты из базы."
-    )
+    await update.message.reply_text(GREETING_TEXT)
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
@@ -228,6 +214,7 @@ async def ask_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text
+    import re
     nums = re.findall(r"\d+", txt.replace(" ", ""))
     if len(nums)==1:
         val = int(nums[0]); val = val*1000 if val < 1000 else val
@@ -239,12 +226,13 @@ async def ask_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bmin, bmax = min(a,b), max(a,b)
     else:
         bmin, bmax = 0, 10**9
-    context.user_data["budget_min"] = bmin
-    context.user_data["budget_max"] = bmax
+    context.user_data["budget_min"]=bmin
+    context.user_data["budget_max"]=bmax
     await update.message.reply_text("Сколько спален нужно?")
     return ASK_BEDS
 
 async def ask_pets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import re
     brs = re.findall(r"\d+", update.message.text)
     context.user_data["bedrooms"] = int(brs[0]) if brs else 0
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Да", callback_data="pets_yes"),
@@ -255,7 +243,7 @@ async def ask_pets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    context.user_data["pets"] = "TRUE" if q.data == "pets_yes" else "FALSE"
+    context.user_data["pets"] = "TRUE" if q.data=="pets_yes" else "FALSE"
     await q.edit_message_text("На какие даты планируете заезд/срок аренды?")
     return ASK_DATES
 
@@ -264,10 +252,10 @@ async def finish_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = listings_all()
     crit = {
         "location_pref": context.user_data.get("location_pref",""),
-        "budget_min": context.user_data.get("budget_min",0),
-        "budget_max": context.user_data.get("budget_max",10**9),
-        "bedrooms": context.user_data.get("bedrooms",0),
-        "pets": context.user_data.get("pets","UNKNOWN"),
+        "budget_min":    context.user_data.get("budget_min",0),
+        "budget_max":    context.user_data.get("budget_max",10**9),
+        "bedrooms":      context.user_data.get("bedrooms",0),
+        "pets":          context.user_data.get("pets","UNKNOWN"),
     }
     top = match_by_criteria(crit, items)
     matched_ids = ",".join([str(it.get("listing_id")) for it in top])
@@ -314,6 +302,7 @@ def heuristics_criteria(text: str) -> Dict[str,Any]:
     loc = extract_location(text)
     beds = extract_bedrooms(text) or 0
     budget_min, budget_max = 0, 10**9
+    import re
     nums = re.findall(r"\d[\d\s]{1,}", text)
     if nums:
         vals = []
@@ -359,71 +348,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "dates": "",
         "matched_ids": ",".join([str(it.get("listing_id")) for it in top])
     })
-    if MANAGER_CHAT_ID:
-        await context.bot.send_message(
-            MANAGER_CHAT_ID,
-            f"Запрос от @{update.effective_user.username}: {txt}\nПодбор: {','.join([str(it.get('listing_id')) for it in top]) or 'нет'}"
-        )
 
 # ---------- CHANNEL POSTS -> SHEETS ----------
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
     text = (msg.caption or msg.text or "").strip()
     if not text: return
-
     listing_id = msg.message_id
     if listing_exists(listing_id): return
 
     title = text.splitlines()[0][:120] if text else "Объект"
     desc  = "\n".join(text.splitlines()[1:])[:4000]
-
     location = extract_location(text)
     bedrooms = extract_bedrooms(text) or ""
     bathrooms = extract_bathrooms(text) or ""
     price_month = extract_price_month(text) or ""
     pets_allowed = extract_pets(text)
     el_rate, water_rate = extract_rates(text)
-    extra = llm_extract(text)
 
     imgs = []
     if msg.photo: imgs.append(msg.photo[-1].file_id)
-    link = tme_link_for_message(msg.chat.id, msg.message_id)
+    link = tme_link(msg.chat.id, msg.message_id)
 
     row = {
-        "listing_id": listing_id, "created_at": now_iso(),
-        "title": extra.get("title") or title, "description": desc,
-        "location": (extra.get("location") or location),
-        "bedrooms": extra.get("bedrooms") or bedrooms,
-        "bathrooms": extra.get("bathrooms") or bathrooms,
-        "price_month": extra.get("price_month") or price_month,
-        "pets_allowed": (extra.get("pets_allowed") or pets_allowed),
-        "utilities": extra.get("utilities") or "",
-        "electricity_rate": extra.get("electricity_rate") or (el_rate if el_rate is not None else ""),
-        "water_rate": extra.get("water_rate") or (water_rate if water_rate is not None else ""),
-        "area_m2": extra.get("area_m2") or "",
-        "pool": extra.get("pool") or "UNKNOWN",
-        "furnished": extra.get("furnished") or "UNKNOWN",
-        "link": link, "images": ",".join(imgs),
-        "tags": ",".join(extra.get("tags", [])), "raw_text": text
+        "listing_id": listing_id, "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "title": title, "description": desc,
+        "location": location, "bedrooms": bedrooms, "bathrooms": bathrooms,
+        "price_month": price_month, "pets_allowed": pets_allowed,
+        "utilities": "", "electricity_rate": el_rate if el_rate is not None else "",
+        "water_rate": water_rate if water_rate is not None else "",
+        "area_m2": "", "pool": "UNKNOWN", "furnished":"UNKNOWN",
+        "link": link, "images": ",".join(imgs), "tags": "", "raw_text": text
     }
     append_listing(row)
     log.info("Saved listing %s to Sheets", listing_id)
 
-# ---------- ERROR HANDLER ----------
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error: %s", context.error)
-
-# ---------- BOOT ----------
+# ---------- BUILD APP / WEBHOOK ----------
 async def post_init(app):
     me = await app.bot.get_me()
-    log.info("Bot started. Username: %s", me.username)
+    log.info("Bot started: @%s (webhook)", me.username)
 
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
-    app.add_error_handler(on_error)
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("id",    cmd_id))
-    app.add_handler(CommandHandler("rent",  cmd_rent))
+    # Порядок важен: сначала ConversationHandler, потом прочие
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", cmd_rent)],
         states={
@@ -437,26 +404,23 @@ def build_app():
         allow_reentry=True,
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
 def main():
-    backoff = 5
-    while True:
-        try:
-            app = build_app()
-            log.info("Polling...")
-            app.run_polling(allowed_updates=["message","channel_post","callback_query"])
-            break  # обычное завершение
-        except Conflict:
-            # если где-то уже запущен такой же токен
-            log.error("409 Conflict: уже есть другая сессия getUpdates. Повтор через %s c", backoff)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)  # экспоненциальный бэкофф
-        except Exception as e:
-            log.exception("Fatal error, retry: %s", e)
-            time.sleep(5)
+    app = build_app()
+    log.info("Starting webhook on %s%s", BASE_URL, WEBHOOK_PATH)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=f"{BASE_URL}{WEBHOOK_PATH}",
+        allowed_updates=["message","channel_post","callback_query"],
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
