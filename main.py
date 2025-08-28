@@ -1,4 +1,4 @@
-# main.py — Cozy Asia Bot (PTB v21) + Google Sheets
+# main.py — Cozy Asia Bot (polling без Render трюков)
 import os, json, re, logging, time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
@@ -21,7 +21,7 @@ log = logging.getLogger("cozyasia-bot")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GOOGLE_SHEETS_DB_ID = os.environ["GOOGLE_SHEETS_DB_ID"]
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # опционально
 MANAGER_CHAT_ID = int(os.environ.get("MANAGER_CHAT_ID", "0"))
 PUBLIC_CHANNEL_USERNAME = os.environ.get("PUBLIC_CHANNEL_USERNAME", "").lstrip("@")  # без @
 
@@ -56,7 +56,6 @@ def _ensure_ws_exact(name: str, header: List[str]):
     return ws
 
 # ---------- SHEETS SCHEMA ----------
-# Listings — как на скрине (без available_from), ПОРЯДОК КОЛОНОК ВАЖЕН
 WS_LISTINGS_HDR = [
     "listing_id","created_at","title","description","location","bedrooms","bathrooms",
     "price_month","pets_allowed","utilities","electricity_rate","water_rate",
@@ -75,7 +74,6 @@ def now_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 def tme_link_for_message(chat_id: int, message_id: int) -> str:
-    # публичный канал по username или приватный по internal id
     if PUBLIC_CHANNEL_USERNAME:
         return f"https://t.me/{PUBLIC_CHANNEL_USERNAME}/{message_id}"
     abs_id = str(chat_id).replace("-100", "")
@@ -83,30 +81,21 @@ def tme_link_for_message(chat_id: int, message_id: int) -> str:
 
 def parse_num(text: str) -> Optional[int]:
     m = re.search(r"(\d[\d\s'.,]{2,})", text.replace("\u202f", " "))
-    if not m:
-        return None
+    if not m: return None
     raw = m.group(1).replace(" ", "").replace("'", "").replace(",", "")
-    try:
-        return int(float(raw))
-    except:
-        return None
+    try: return int(float(raw))
+    except: return None
 
 AREA_WORDS = {
-    "lamai": ["ламай","lamai"],
-    "bophut": ["бофут","bophut","fisherman"],
-    "chaweng": ["чавенг","chaweng"],
-    "maenam": ["маенам","maenam"],
-    "bangrak": ["банграк","bangrak"],
-    "choengmon": ["чонгмон","чоенгмон","choeng mon","choengmon"],
-    "lipanoi": ["липаной","lipa noi","lipanoi"],
-    "nathon": ["натон","nathon"],
+    "lamai": ["ламай","lamai"], "bophut": ["бофут","bophut","fisherman"],
+    "chaweng": ["чавенг","chaweng"], "maenam":["маенам","maenam"],
+    "bangrak":["банграк","bangrak"], "choengmon":["чонгмон","чоенгмон","choeng mon","choengmon"],
+    "lipanoi":["липаной","lipa noi","lipanoi"], "nathon":["натон","nathon"],
 }
-
 def extract_location(text: str) -> str:
     t = text.lower()
     for key, vs in AREA_WORDS.items():
-        if any(v in t for v in vs):
-            return key
+        if any(v in t for v in vs): return key
     return ""
 
 def extract_bedrooms(text: str) -> Optional[int]:
@@ -119,33 +108,25 @@ def extract_bathrooms(text: str) -> Optional[int]:
 
 def extract_price_month(text: str) -> Optional[int]:
     t = text.lower().replace("к","000")
-    if any(x in t for x in ["бат","thb","฿","/мес","/month"]):
-        return parse_num(t)
+    if any(x in t for x in ["бат","thb","฿","/мес","/month"]): return parse_num(t)
     return parse_num(t)
 
 def extract_pets(text: str) -> str:
     t = text.lower()
-    if "без животных" in t or "no pets" in t:
-        return "FALSE"
-    if "с питомц" in t or "pets ok" in t or "pets allowed" in t:
-        return "TRUE"
+    if "без животных" in t or "no pets" in t: return "FALSE"
+    if "с питомц" in t or "pets ok" in t or "pets allowed" in t: return "TRUE"
     return "UNKNOWN"
 
 def extract_rates(text: str) -> Tuple[Optional[float], Optional[float]]:
-    el = None
-    water = None
+    el = water = None
     m1 = re.search(r"(\d+(?:[.,]\d+)?)\s*бат.?/?\s*квт", text.lower())
-    if m1:
-        el = float(m1.group(1).replace(",", "."))
+    if m1: el = float(m1.group(1).replace(",","."))
     m2 = re.search(r"(\d+(?:[.,]\d+)?)\s*бат.?/?\s*м3", text.lower())
-    if m2:
-        water = float(m2.group(1).replace(",", "."))
+    if m2: water = float(m2.group(1).replace(",","."))
     return el, water
 
 def llm_extract(text: str) -> Dict[str, Any]:
-    """Опциональное обогащение через OpenAI (если есть ключ)."""
-    if not OPENAI_API_KEY:
-        return {}
+    if not OPENAI_API_KEY: return {}
     try:
         import openai
         openai.api_key = OPENAI_API_KEY
@@ -155,8 +136,7 @@ def llm_extract(text: str) -> Dict[str, Any]:
                "water_rate, area_m2, pool(TRUE/FALSE/UNKNOWN), furnished(TRUE/FALSE/UNKNOWN), tags[].")
         resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},
-                      {"role":"user","content":text}],
+            messages=[{"role":"system","content":sys},{"role":"user","content":text}],
             temperature=0
         )
         j = resp["choices"][0]["message"]["content"].strip()
@@ -167,52 +147,35 @@ def llm_extract(text: str) -> Dict[str, Any]:
         return {}
 
 # ---------- SHEETS OPS ----------
-def listings_all() -> List[Dict[str, Any]]:
+def listings_all() -> List[Dict[str,Any]]:
     return ws_listings.get_all_records()
 
 def listing_exists(listing_id: int) -> bool:
-    ids = set(ws_listings.col_values(1)[1:])
-    return str(listing_id) in ids
+    return str(listing_id) in set(ws_listings.col_values(1)[1:])
 
-def append_listing(row: Dict[str, Any]):
-    values = [
-        row.get("listing_id",""),
-        row.get("created_at",""),
-        row.get("title",""),
-        row.get("description",""),
-        row.get("location",""),
-        row.get("bedrooms",""),
-        row.get("bathrooms",""),
-        row.get("price_month",""),
-        row.get("pets_allowed",""),
-        row.get("utilities",""),
-        row.get("electricity_rate",""),
-        row.get("water_rate",""),
-        row.get("area_m2",""),
-        row.get("pool",""),
-        row.get("furnished",""),
-        row.get("link",""),
-        row.get("images",""),
-        row.get("tags",""),
-        row.get("raw_text",""),
-    ]
-    ws_listings.append_row(values, value_input_option="RAW")
+def append_listing(row: Dict[str,Any]):
+    ws_listings.append_row([
+        row.get("listing_id",""), row.get("created_at",""), row.get("title",""),
+        row.get("description",""), row.get("location",""), row.get("bedrooms",""),
+        row.get("bathrooms",""), row.get("price_month",""), row.get("pets_allowed",""),
+        row.get("utilities",""), row.get("electricity_rate",""), row.get("water_rate",""),
+        row.get("area_m2",""), row.get("pool",""), row.get("furnished",""),
+        row.get("link",""), row.get("images",""), row.get("tags",""), row.get("raw_text",""),
+    ], value_input_option="RAW")
 
-def append_lead(row: Dict[str, Any]) -> str:
+def append_lead(row: Dict[str,Any]) -> str:
     lead_id = f"L{int(time.time())}"
     ws_leads.append_row([
-        lead_id, now_iso(),
-        row.get("user_id",""), row.get("username",""),
+        lead_id, now_iso(), row.get("user_id",""), row.get("username",""),
         row.get("query_text",""), row.get("location_pref",""),
         row.get("budget_min",""), row.get("budget_max",""),
-        row.get("bedrooms",""), row.get("pets",""),
-        row.get("dates",""), row.get("matched_ids",""),
-        row.get("status","new")
+        row.get("bedrooms",""), row.get("pets",""), row.get("dates",""),
+        row.get("matched_ids",""), row.get("status","new")
     ], value_input_option="RAW")
     return lead_id
 
 # ---------- MATCH ----------
-def match_by_criteria(criteria: Dict[str, Any], items: List[Dict[str, Any]], top_k:int=6) -> List[Dict[str, Any]]:
+def match_by_criteria(criteria: Dict[str,Any], items: List[Dict[str,Any]], top_k:int=6) -> List[Dict[str,Any]]:
     loc = (criteria.get("location") or criteria.get("location_pref") or "").lower()
     budget_min = int(criteria.get("budget_min") or 0)
     budget_max = int(criteria.get("budget_max") or 10**9)
@@ -223,21 +186,21 @@ def match_by_criteria(criteria: Dict[str, Any], items: List[Dict[str, Any]], top
     for it in items:
         try:
             price = int(it.get("price_month") or 0)
-            br = int(it.get("bedrooms") or 0)
-            it_loc = (it.get("location") or "").lower()
+            br    = int(it.get("bedrooms") or 0)
+            itloc = (it.get("location") or "").lower()
             if price and not (budget_min <= price <= budget_max): continue
             if br_need and br < br_need: continue
             if pets == "TRUE" and str(it.get("pets_allowed","UNKNOWN")).upper() == "FALSE": continue
             score = 0.0
             if budget_max < 10**9 and price:
-                mid = (budget_min + budget_max) / 2
-                score -= abs(price - mid) / max(mid, 1)
-            if loc and loc in it_loc: score += 0.6
+                mid = (budget_min + budget_max)/2
+                score -= abs(price - mid) / max(mid,1)
+            if loc and loc in itloc: score += 0.6
             if br >= br_need: score += 0.2
             it["_score"] = score
             out.append(it)
-        except:
-            continue
+        except:  # noqa
+            pass
     out.sort(key=lambda x: x.get("_score",0), reverse=True)
     return out[:top_k]
 
@@ -249,6 +212,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я ассистент Cozy Asia 🏝️\n"
         "Напиши, что ищешь (район, бюджет, спальни, с питомцами и т.д.) или нажми /rent — подберу варианты из базы."
     )
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
 
 async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -263,13 +229,13 @@ async def ask_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text
     nums = re.findall(r"\d+", txt.replace(" ", ""))
-    if len(nums) == 1:
-        val = int(nums[0]);  val = val*1000 if val < 1000 else val
+    if len(nums)==1:
+        val = int(nums[0]); val = val*1000 if val < 1000 else val
         bmin, bmax = 0, val
-    elif len(nums) >= 2:
+    elif len(nums)>=2:
         a, b = int(nums[0]), int(nums[1])
-        if a < 1000: a *= 1000
-        if b < 1000: b *= 1000
+        if a<1000: a*=1000
+        if b<1000: b*=1000
         bmin, bmax = min(a,b), max(a,b)
     else:
         bmin, bmax = 0, 10**9
@@ -281,10 +247,8 @@ async def ask_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_pets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     brs = re.findall(r"\d+", update.message.text)
     context.user_data["bedrooms"] = int(brs[0]) if brs else 0
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Да", callback_data="pets_yes"),
-         InlineKeyboardButton("Нет", callback_data="pets_no")]
-    ])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Да", callback_data="pets_yes"),
+                                InlineKeyboardButton("Нет", callback_data="pets_no")]])
     await update.message.reply_text("С питомцами?", reply_markup=kb)
     return ASK_PETS
 
@@ -297,14 +261,13 @@ async def ask_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def finish_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["dates"] = update.message.text.strip()
-
     items = listings_all()
     crit = {
         "location_pref": context.user_data.get("location_pref",""),
-        "budget_min":    context.user_data.get("budget_min",0),
-        "budget_max":    context.user_data.get("budget_max",10**9),
-        "bedrooms":      context.user_data.get("bedrooms",0),
-        "pets":          context.user_data.get("pets","UNKNOWN"),
+        "budget_min": context.user_data.get("budget_min",0),
+        "budget_max": context.user_data.get("budget_max",10**9),
+        "bedrooms": context.user_data.get("bedrooms",0),
+        "pets": context.user_data.get("pets","UNKNOWN"),
     }
     top = match_by_criteria(crit, items)
     matched_ids = ",".join([str(it.get("listing_id")) for it in top])
@@ -347,7 +310,7 @@ async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ---------- FREE TEXT ----------
-def heuristics_criteria(text: str) -> Dict[str, Any]:
+def heuristics_criteria(text: str) -> Dict[str,Any]:
     loc = extract_location(text)
     beds = extract_bedrooms(text) or 0
     budget_min, budget_max = 0, 10**9
@@ -361,8 +324,8 @@ def heuristics_criteria(text: str) -> Dict[str, Any]:
         if len(vals) == 1:
             budget_max = vals[0]
         else:
-            a, b = sorted(vals[:2])
-            budget_min, budget_max = a, b
+            a,b = sorted(vals[:2])
+            budget_min, budget_max = a,b
     pets = extract_pets(text)
     return {"location_pref": loc, "bedrooms": beds, "budget_min": budget_min, "budget_max": budget_max, "pets": pets}
 
@@ -406,12 +369,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
     text = (msg.caption or msg.text or "").strip()
-    if not text:
-        return
+    if not text: return
 
     listing_id = msg.message_id
-    if listing_exists(listing_id):
-        return
+    if listing_exists(listing_id): return
 
     title = text.splitlines()[0][:120] if text else "Объект"
     desc  = "\n".join(text.splitlines()[1:])[:4000]
@@ -425,9 +386,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     extra = llm_extract(text)
 
     imgs = []
-    if msg.photo:
-        imgs.append(msg.photo[-1].file_id)
-
+    if msg.photo: imgs.append(msg.photo[-1].file_id)
     link = tme_link_for_message(msg.chat.id, msg.message_id)
 
     row = {
@@ -450,41 +409,9 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     append_listing(row)
     log.info("Saved listing %s to Sheets", listing_id)
 
-# ---------- SERVICE CMDS ----------
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
-
-async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if MANAGER_CHAT_ID and update.effective_user.id != MANAGER_CHAT_ID:
-        await update.message.reply_text("Команда доступна менеджеру.");  return
-    await update.message.reply_text("Ок. Кеш обновится при следующем запросе.")
-
-# ---------- ERRORS ----------
+# ---------- ERROR HANDLER ----------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
-
-# ---------- PREFLIGHT ----------
-def preflight_release_slot(token: str):
-    base = f"https://api.telegram.org/bot{token}"
-    # 1) Сносим вебхук и очередь апдейтов
-    try:
-        r = requests.post(f"{base}/deleteWebhook",
-                          params={"drop_pending_updates": True}, timeout=10)
-        log.info("deleteWebhook -> %s", r.json())
-    except Exception as e:
-        log.warning("deleteWebhook error: %s", e)
-    # 2) Один аккуратный /close с уважением retry_after
-    try:
-        r = requests.post(f"{base}/close", timeout=10)
-        data = r.json()
-        if not data.get("ok") and data.get("error_code") == 429:
-            wait = int(data.get("parameters", {}).get("retry_after", 60))
-            log.warning("close rate-limited: retry_after=%ss (делаем одну паузу)", wait)
-            time.sleep(wait + 2)
-        else:
-            log.info("close -> %s", data)
-    except Exception as e:
-        log.warning("close error: %s", e)
 
 # ---------- BOOT ----------
 async def post_init(app):
@@ -496,7 +423,7 @@ def build_app():
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id",    cmd_id))
-    app.add_handler(CommandHandler("refresh_cache", cmd_refresh))
+    app.add_handler(CommandHandler("rent",  cmd_rent))
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", cmd_rent)],
         states={
@@ -510,25 +437,26 @@ def build_app():
         allow_reentry=True,
     )
     app.add_handler(conv)
-    # новые посты канала → в Sheets
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
-    # свободный текст (диалоги с пользователями)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
 def main():
-    # освобождаем polling-слот; потом запускаемся с ретраями только на 409
-    preflight_release_slot(TELEGRAM_BOT_TOKEN)
-    for attempt in range(4):
+    backoff = 5
+    while True:
         try:
             app = build_app()
-            log.info("Polling (attempt %d)...", attempt + 1)
+            log.info("Polling...")
             app.run_polling(allowed_updates=["message","channel_post","callback_query"])
-            break
+            break  # обычное завершение
         except Conflict:
-            backoff = 5 + attempt * 10
-            log.error("409 Conflict: другая сессия getUpdates. Повтор через %s c", backoff)
+            # если где-то уже запущен такой же токен
+            log.error("409 Conflict: уже есть другая сессия getUpdates. Повтор через %s c", backoff)
             time.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # экспоненциальный бэкофф
+        except Exception as e:
+            log.exception("Fatal error, retry: %s", e)
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
