@@ -2,34 +2,33 @@
 """
 Cozy Asia Bot — webhook для Render + локальный polling.
 
-ENV (точные имена):
+ENV:
   TELEGRAM_BOT_TOKEN   — обяз.
   BASE_URL             — https://telegram-gpt-consultant-xxxx.onrender.com (пусто = polling)
   WEBHOOK_PATH         — /webhook
-  PUBLIC_CHANNEL       — юзернейм канала без @ (для парсинга в Listings)
-  GREETING_MESSAGE     — произвольный текст приветствия
+  PUBLIC_CHANNEL       — username канала без @
+  GREETING_MESSAGE     — текст приветствия
   MANAGER_CHAT_ID      — чат ID менеджера (int, опц.)
-  GOOGLE_SHEET_ID      — ID таблицы (если пишем в Sheets)
+  GOOGLE_SHEET_ID      — ID таблицы
   GOOGLE_CREDS_JSON    — JSON сервис-аккаунта целиком
-  OPENAI_API_KEY       — для свободного диалога GPT
-  LOG_LEVEL            — INFO/DEBUG и т.п.
+  OPENAI_API_KEY       — ключ OpenAI (для свободного чата)
+  LOG_LEVEL            — INFO/DEBUG...
 """
 
 import os
 import re
 import json
-import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, List
 
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters
 )
 
-# ===== ЛОГИ ===================================================================
+# ================== ЛОГИ ==================
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -37,24 +36,22 @@ logging.basicConfig(
 )
 log = logging.getLogger("cozy_bot")
 
-# ===== ENV ====================================================================
+# ================== ENV ===================
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "").lstrip("@").strip()
 GREETING_MESSAGE = os.environ.get(
     "GREETING_MESSAGE",
-    "Привет! Я ассистент Cozy Asia 🌴\n"
-    "Напиши, что ищешь (район, бюджет, спальни, пожелания и т.д.) "
+    "Привет! Я ассистент Cozy Asia 🌴\nНапиши, что ищешь (район, бюджет, спальни, пожелания и т.д.) "
     "или нажми /rent — подберу варианты из базы.",
 )
 MANAGER_CHAT_ID = os.environ.get("MANAGER_CHAT_ID", "").strip() or None
-
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-# ===== GPT ====================================================================
+# ================== GPT ===================
 gpt_enabled = bool(OPENAI_API_KEY)
 client = None
 if gpt_enabled:
@@ -66,13 +63,11 @@ if gpt_enabled:
         gpt_enabled = False
 
 async def gpt_reply(prompt: str, history: List[Dict[str, str]]) -> str:
-    """Короткий хелпер для GPT. history — список {'role','content'} последних ходов."""
     if not gpt_enabled or client is None:
-        return "Я могу общаться в свободной форме, но сейчас не настроен ключ OPENAI_API_KEY."
+        return "Свободный диалог доступен, но не задан ключ OPENAI_API_KEY."
     try:
-        # бережно ограничим контекст
         msgs = [{"role": "system", "content": "Ты дружелюбный риэлтор-ассистент на Самуи от Cozy Asia."}]
-        msgs += history[-8:]  # последние 8 сообщений
+        msgs += history[-8:]
         msgs.append({"role": "user", "content": prompt})
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -84,7 +79,7 @@ async def gpt_reply(prompt: str, history: List[Dict[str, str]]) -> str:
         log.exception("GPT error: %s", e)
         return "Пока не могу ответить (внутренняя ошибка GPT)."
 
-# ===== Google Sheets ===========================================================
+# ============ Google Sheets ===============
 gspread = None
 sheet_ok = False
 ws_leads = None
@@ -119,7 +114,6 @@ def setup_gsheets():
         gc = gspread.authorize(Credentials.from_service_account_info(creds, scopes=scopes))
         sh = gc.open_by_key(GOOGLE_SHEET_ID)
 
-        # Leads
         titles = [w.title for w in sh.worksheets()]
         if LEADS_SHEET_NAME in titles:
             ws_leads = sh.worksheet(LEADS_SHEET_NAME)
@@ -127,7 +121,6 @@ def setup_gsheets():
             ws_leads = sh.add_worksheet(LEADS_SHEET_NAME, rows="1000", cols=str(len(LEADS_COLUMNS)))
             ws_leads.append_row(LEADS_COLUMNS)
 
-        # Listings
         if LISTINGS_SHEET_NAME in titles:
             ws_listings = sh.worksheet(LISTINGS_SHEET_NAME)
         else:
@@ -154,7 +147,7 @@ def listings_append(row: Dict[str, Any]):
         except Exception as e:
             log.exception("Sheets append listing error: %s", e)
 
-# ===== Простой парсер объявлений (канал) ======================================
+# ======= Парсер объявлений из канала ======
 REGION_WORDS = [
     "lamai","lamaï","ламай","bophut","bo phut","бопхут","chaweng","чавенг",
     "maenam","маенам","bangrak","ban rak","банграк","банрак",
@@ -167,7 +160,6 @@ def parse_listing_text(text: str, link: str, listing_id: str) -> Dict[str, Any]:
     m_bed = re.search(r"(\d+)\s*(спальн|bed)", t)
     m_bath = re.search(r"(\d+)\s*(ванн|bath)", t)
     m_price = re.search(r"(\d[\d\s]{3,})(?:\s*(?:baht|бат|฿|thb|b))?", t)
-
     return {
         "listing_id": listing_id,
         "created_at": datetime.utcnow().isoformat(timespec="seconds"),
@@ -190,7 +182,7 @@ def parse_listing_text(text: str, link: str, listing_id: str) -> Dict[str, Any]:
         "raw_text": text,
     }
 
-# ===== Диалог /rent ===========================================================
+# =============== Диалог /rent =============
 (
     Q_LOCATION, Q_BEDROOMS, Q_BUDGET, Q_OCCUPANTS,
     Q_PETS, Q_POOL, Q_WORKSPACE, Q_PHONE, Q_NOTES
@@ -249,7 +241,6 @@ async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def finish_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["notes"] = update.message.text.strip()
-
     user = update.effective_user
     lead = {
         "created_at": datetime.utcnow().isoformat(timespec="seconds"),
@@ -267,7 +258,6 @@ async def finish_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     leads_append(lead)
 
-    # Уведомим менеджера
     if MANAGER_CHAT_ID:
         try:
             txt = (
@@ -291,12 +281,11 @@ async def cancel_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Опрос отменён. Введите /rent чтобы начать заново.")
     return ConversationHandler.END
 
-# ===== Свободный диалог (GPT) =================================================
+# ======= Свободный GPT-чат в ЛС ===========
 async def chat_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text.startswith("/"):
-        return  # команды ловят другие хендлеры
-    # подержим короткую историю в chat_data
+        return
     hist = context.chat_data.setdefault("history", [])
     hist.append({"role": "user", "content": text})
     hist[:] = hist[-10:]
@@ -304,7 +293,7 @@ async def chat_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hist.append({"role": "assistant", "content": reply})
     await update.message.reply_text(reply)
 
-# ===== Посты канала ===========================================================
+# ======= Посты из канала ==================
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.channel_post:
         return
@@ -320,7 +309,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     listings_append(row)
     log.info("Сохранён лот %s из @%s", row["listing_id"], uname)
 
-# ===== Сборка приложения ======================================================
+# ============ Сборка приложения ===========
 def build_app() -> Application:
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -344,7 +333,7 @@ def build_app() -> Application:
     )
     app.add_handler(conv)
 
-    # GPT-чат — после всех команд/диалогов
+    # GPT-чат в личке (последний, чтобы не перехватывал команды)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, chat_any_text))
 
     # Посты каналов
@@ -352,53 +341,30 @@ def build_app() -> Application:
 
     return app
 
-# ===== Запуск: webhook / polling =============================================
-async def run_webhook(app: Application):
-    """Аккуратный webhook БЕЗ run_webhook/loop.close конфликтов."""
-    await app.initialize()
-
-    # чистим старый вебхук и апдейты
-    await app.bot.delete_webhook(drop_pending_updates=True)
-
-    webhook_url = f"{BASE_URL}{WEBHOOK_PATH if WEBHOOK_PATH.startswith('/') else '/'+WEBHOOK_PATH}"
-    await app.bot.set_webhook(url=webhook_url, allowed_updates=["message", "channel_post", "callback_query"])
-
-    await app.start()
-    await app.updater.start_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
-        url_path=WEBHOOK_PATH.lstrip("/"),
-        webhook_url=webhook_url,
-        allowed_updates=["message", "channel_post", "callback_query"],
-    )
-    log.info("Webhook started at %s", webhook_url)
-    try:
-        await app.updater.wait()
-    finally:
-        await app.stop()
-        await app.shutdown()
-
-async def run_polling(app: Application):
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.initialize()
-    await app.start()
-    log.info("Polling started…")
-    try:
-        await app.updater.start_polling(allowed_updates=["message", "channel_post", "callback_query"])
-        await app.updater.wait()
-    finally:
-        await app.stop()
-        await app.shutdown()
-
-async def async_main():
+# ================== MAIN ==================
+def main():
     setup_gsheets()
     app = build_app()
-    me = await app.bot.get_me()
+
+    me = app.bot.get_me(timeout=20)
     log.info("Bot: @%s", me.username)
+
+    allowed = ["message", "channel_post", "callback_query"]
+
     if BASE_URL:
-        await run_webhook(app)
+        webhook_url = f"{BASE_URL}{WEBHOOK_PATH if WEBHOOK_PATH.startswith('/') else '/'+WEBHOOK_PATH}"
+        log.info("Starting webhook at %s", webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", "10000")),
+            url_path=WEBHOOK_PATH.lstrip("/"),
+            webhook_url=webhook_url,
+            allowed_updates=allowed,
+            drop_pending_updates=True,
+        )
     else:
-        await run_polling(app)
+        log.info("Starting polling…")
+        app.run_polling(allowed_updates=allowed, drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(async_main())
+    main()
