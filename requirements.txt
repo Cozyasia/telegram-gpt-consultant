@@ -1,8 +1,12 @@
 python-telegram-bot[webhooks]==21.6
+openai>=1.40.0
+requests==2.32.3
+
+# Sheets (опционально, но пусть будут)
 gspread==6.0.2
 google-auth==2.31.0
-cachetools==5.4.0
 oauthlib==3.2.2
-requests==2.32.3
-openai==1.40.0
+cachetools==5.4.0
+
+# Свободный парсинг дат
 python-dateutil==2.9.0.post0
