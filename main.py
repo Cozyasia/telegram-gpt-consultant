@@ -1,27 +1,24 @@
 # main.py — Cozy Asia Bot (python-telegram-bot v21.6, webhook/Render)
 # -----------------------------------------------------------------------------
-# Возможности:
 # • /start — приветствие
 # • /rent — анкета (7 шагов): type → budget → area → bedrooms → check-in → check-out → notes
-#   - даты распознаются в ЛЮБОМ привычном формате и сохраняются как YYYY-MM-DD
-#   - после анкеты: запись в Google Sheets (если настроено), подборки-ссылки из каналов,
-#     уведомления менеджеру и в рабочую группу, кнопка “Написать менеджеру”
-#   - анти-дубликаты (повторная отправка в течение 15 мин. не создаёт новую запись)
-# • Свободный GPT-чат (OpenAI): отвечает на любые темы
-#   - если разговор уходит к недвижимости — НЕ прерывает ответ, а ДОБАВЛЯЕТ ваш CTA
-#     (сайт/каналы/Instagram + /rent). Никогда не рекламирует сторонние агентства/агрегаторы
-# • /id, /groupid, /diag — сервисные команды
+#   - даты распознаются в любом привычном формате (сохраняем YYYY-MM-DD)
+#   - запись в Google Sheets (если настроено), подборки-ссылки из Telegram-каналов
+#   - уведомления менеджеру и в рабочую группу, кнопка “Написать менеджеру”
+#   - анти-дубликаты: в течение 15 минут одинаковая заявка не шлётся повторно
+# • Свободный GPT-чат (OpenAI) с фолбэками:
+#   - если OpenAI недоступен, отвечаем кратко из локального FAQ по погоде/ветрам Самуи
+#   - при “недвижимостных” темах — добавляем CTA Cozy Asia (без рекомендаций сторонних агентств)
+# • /id, /groupid, /diag — сервис
 #
-# Переменные окружения (ENV):
-#   TELEGRAM_BOT_TOKEN (обязательно)
-#   OPENAI_API_KEY     (обязательно)
-#   WEBHOOK_BASE или RENDER_EXTERNAL_URL (обязательно, публичный URL сервиса)
-#   GOOGLE_SHEETS_DB_ID                (опционально — ID таблицы)
-#   GOOGLE_SERVICE_ACCOUNT_JSON        (опционально — JSON сервис-аккаунта Google, одной строкой)
-#   GOOGLE_SHEETS_SHEET_NAME=Leads     (опционально)
-#   GROUP_CHAT_ID                      (опционально — ID рабочей группы)
-#
-# Запуск на Render: python main.py
+# ENV:
+#   TELEGRAM_BOT_TOKEN  (обяз.)
+#   OPENAI_API_KEY      (обяз. для GPT)
+#   WEBHOOK_BASE или RENDER_EXTERNAL_URL (обяз. публичный URL)
+#   GOOGLE_SHEETS_DB_ID             (опц.)
+#   GOOGLE_SERVICE_ACCOUNT_JSON     (опц., в одну строку)
+#   GOOGLE_SHEETS_SHEET_NAME=Leads  (опц.)
+#   GROUP_CHAT_ID                   (опц., ID рабочей группы)
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -38,12 +35,12 @@ from telegram.ext import (
     ConversationHandler, MessageHandler, filters
 )
 
-# ─────────────── ЛОГИ
+# ───────────────────── ЛОГИ
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("cozyasia-bot")
 
-# ─────────────── КОНСТАНТЫ/ССЫЛКИ (замени при необходимости)
+# ───────────────────── ССЫЛКИ/КОНСТАНТЫ
 WEBSITE_URL       = "https://cozy.asia"
 TG_CHANNEL_MAIN   = "https://t.me/SamuiRental"
 TG_CHANNEL_VILLAS = "https://t.me/arenda_vill_samui"
@@ -51,11 +48,9 @@ INSTAGRAM_URL     = "https://www.instagram.com/cozy.asia?igsh=cmt1MHA0ZmM3OTRu"
 MAIN_CH_USERNAME   = "SamuiRental"
 VILLAS_CH_USERNAME = "arenda_vill_samui"
 
-# Менеджер (контакт показываем ТОЛЬКО ПОСЛЕ анкеты)
-MANAGER_TG_URL  = "https://t.me/Cozy_asia"  # @Cozy_asia
-MANAGER_CHAT_ID = 5978240436                # личка менеджера
+MANAGER_TG_URL  = "https://t.me/Cozy_asia"   # показываем только после анкеты
+MANAGER_CHAT_ID = 5978240436
 
-# Рабочая группа (можно задать через ENV GROUP_CHAT_ID)
 GROUP_CHAT_ID: Optional[int] = None
 if os.getenv("GROUP_CHAT_ID"):
     try:
@@ -63,7 +58,6 @@ if os.getenv("GROUP_CHAT_ID"):
     except Exception:
         log.warning("GROUP_CHAT_ID из ENV не int: %r", os.getenv("GROUP_CHAT_ID"))
 
-# ─────────────── ТЕКСТЫ/КЛЮЧИ
 START_TEXT = (
     "✅ Я уже тут!\n"
     "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
@@ -84,17 +78,16 @@ BLOCK_PATTERNS = (
 )
 
 TYPE, BUDGET, AREA, BEDROOMS, CHECKIN, CHECKOUT, NOTES = range(7)
-DUPLICATE_COOLDOWN_SEC = 15 * 60  # 15 минут
+DUPLICATE_COOLDOWN_SEC = 15 * 60
 
-# ─────────────── УТИЛИТЫ
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 def env_required(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
+    v = os.getenv(name)
+    if not v:
         raise RuntimeError(f"ENV {name} is required but missing")
-    return val
+    return v
 
 def mentions_realty(text: str) -> bool:
     t = (text or "").lower()
@@ -104,8 +97,7 @@ def looks_like_realty_question(text: str) -> bool:
     return mentions_realty(text or "")
 
 def sanitize_competitors(text: str) -> str:
-    if not text:
-        return text
+    if not text: return text
     low = text.lower()
     if any(p in low for p in BLOCK_PATTERNS):
         msg, _ = build_cta_public()
@@ -113,7 +105,6 @@ def sanitize_competitors(text: str) -> str:
     return text
 
 def parse_to_iso_date(text: str) -> str:
-    """Любые привычные форматы → YYYY-MM-DD; если не вышло — возвращаем как есть."""
     s = (text or "").strip()
     if not s: return s
     try:
@@ -121,12 +112,12 @@ def parse_to_iso_date(text: str) -> str:
         return dt.strftime("%Y-%m-%d")
     except Exception:
         try:
-            dt = dtparser.parse(s, dayfirst=False, yearfirst=True,  fuzzy=True)
+            dt = dtparser.parse(s, dayfirst=False, yearfirst=True, fuzzy=True)
             return dt.strftime("%Y-%m-%d")
         except Exception:
             return s
 
-# ─────────────── CTA/КНОПКИ
+# ───────────────────── CTA/Кнопки
 def build_cta_public() -> Tuple[str, InlineKeyboardMarkup]:
     kb = [
         [InlineKeyboardButton("🌐 Открыть сайт", url=WEBSITE_URL)],
@@ -151,7 +142,7 @@ def build_cta_with_manager() -> Tuple[str, InlineKeyboardMarkup]:
     msg += "\n\n👤 Контакт менеджера открыт ниже."
     return msg, kb
 
-# ─────────────── Подборки по каналам (deep search)
+# ───────────────────── Поиск по каналам (быстрые ссылки)
 def build_channel_search_links(area: str, bedrooms: str, budget: str) -> List[Tuple[str, str]]:
     q = " ".join(x for x in [area, f"{bedrooms} спальн" if bedrooms else "", budget] if x).strip()
     qenc = urllib.parse.quote(q) if q else ""
@@ -166,7 +157,7 @@ def format_links_md(pairs: List[Tuple[str,str]]) -> str:
     if not pairs: return "—"
     return "\n".join([f"• {title}: {url}" for title, url in pairs])
 
-# ─────────────── МОДЕЛЬ ЗАЯВКИ
+# ───────────────────── Модель заявки
 @dataclass
 class Lead:
     created_at: str
@@ -205,7 +196,7 @@ class Lead:
             self.checkin, self.checkout, self.notes, self.source
         ]
 
-# ─────────────── Google Sheets (опционально)
+# ───────────────────── Google Sheets (опц.)
 class SheetsClient:
     def __init__(self, sheet_id: Optional[str], sheet_name: str = "Leads"):
         self.sheet_id = sheet_id
@@ -260,7 +251,7 @@ class SheetsClient:
             log.exception("Sheets append failed: %s", e)
             return False, None
 
-# ─────────────── Уведомления менеджеру/в группу
+# ───────────────────── Уведомления
 async def notify_staff(update: Update, context: ContextTypes.DEFAULT_TYPE,
                        lead: Lead, row_url: Optional[str], proposed_pairs: List[Tuple[str,str]]):
     links_text = format_links_md(proposed_pairs)
@@ -282,15 +273,14 @@ async def notify_staff(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except Exception as e:
             log.warning("Notify failed for %s: %s", chat_id, e)
 
-# ─────────────── OpenAI (свободный чат)
+# ───────────────────── OpenAI + фолбэки
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 
 SYSTEM_PROMPT = (
-    "Ты дружелюбный местный помощник Cozy Asia. Отвечай по сути и кратко.\n"
+    "Ты дружелюбный местный помощник Cozy Asia. Отвечай по делу и кратко.\n"
     "Можно свободно говорить о погоде, ветрах, районах, инфраструктуре, быте, школах и т.д.\n"
     "Если вопрос относится к аренде/покупке/продаже или «где посмотреть лоты», "
-    "ТОЛЬКО добавь в конце мягкий CTA: /rent + ссылки Cozy Asia. Никогда не советуй другие агентства, "
-    "агрегаторы или FB-группы. Если вопрос про недвижимость слишком общий — кратко направь: пройди /rent."
+    "добавь в КОНЦЕ мягкий CTA: /rent + ссылки Cozy Asia. Никогда не советуй другие агентства или агрегаторы."
 )
 
 _openai_client: Optional[OpenAI] = None
@@ -303,28 +293,87 @@ def _get_openai() -> OpenAI:
         _openai_client = OpenAI(api_key=key)
     return _openai_client
 
-async def call_gpt(user_text: str) -> str:
+def local_weather_reply(user_text: str) -> Optional[str]:
+    t = (user_text or "").lower()
+    if any(w in t for w in ("погода","ветер","дожд","тайфун","шторм","волн")):
+        # очень краткая памятка по Самуи
+        month_map = {
+            1:"январь: чаще солнечно, возможны краткие дожди; ветер NE/E, море спокойнее на западе.",
+            2:"февраль: сухо и солнечно, слабый ветер NE/E; купаться комфортно почти везде.",
+            3:"март: жарко, море спокойное; лёгкие бризы.",
+            4:"апрель: самая жара; штиль, редкие ливни.",
+            5:"май: жарко, начинают идти дожди, но короткие.",
+            6:"июнь: переменная облачность, дожди краткие; море в целом спокойное.",
+            7:"июль: комфортно, иногда волна на востоке/севере.",
+            8:"август: похож на июль, умеренные ветра.",
+            9:"сентябрь: чаще волна на востоке, заходить лучше на западе.",
+            10:"октябрь: старт северо-восточного муссона; волны/дожди чаще на восточных пляжах.",
+            11:"ноябрь: пик дождей; ветер NE/E, западные пляжи спокойнее.",
+            12:"декабрь: дождливо, но улучшается к концу месяца; волна на востоке, уютнее на западе/юге."
+        }
+        for i, nm in enumerate(("январ","феврал","март","апрел","май","июн","июл","август","сентябр","октябр","ноябр","декабр"), start=1):
+            if nm in t:
+                return f"На Самуи {month_map[i]}\n⚠️ Погода тропическая и меняется быстро; для точного прогноза смотри за 1–3 дня до даты."
+        return ("Самуи: климат тропический. Окт–дек — больше дождей и волна на востоке; "
+                "янв–март — суше и спокойнее; апрель жаркий штиль; лето умеренное. "
+                "За укрытием от волн часто лучше запад/юг.")
+    return None
+
+async def call_gpt(user_text: str) -> Optional[str]:
+    """
+    Возвращает None только при реальном сбое сети/ключа.
+    Иначе — нормальный текст ответа (с пост-фильтром от конкурентов).
+    """
     try:
         client = _get_openai()
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": (user_text or "").strip()},
-            ],
-            max_output_tokens=400,
-            timeout=20,
-        )
-        text = (resp.output_text or "").strip()
-        return sanitize_competitors(text)
-    except (RateLimitError, APIStatusError, APIConnectionError) as e:
-        logging.warning("OpenAI API error: %s", e)
-        return "Извини, сейчас у меня техническая пауза. Спроси ещё раз через минутку."
-    except Exception as e:
-        logging.exception("OpenAI unexpected error: %s", e)
-        return "Упс, что-то пошло не так. Давай повторим вопрос?"
+        # 1) Responses API
+        try:
+            resp = client.responses.create(
+                model="gpt-4o-mini",
+                input=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": (user_text or "").strip()},
+                ],
+                max_output_tokens=450,
+                timeout=45,
+            )
+            txt = (resp.output_text or "").strip()
+            if txt:
+                return sanitize_competitors(txt)
+        except Exception as e:
+            log.warning("OpenAI responses.create failed: %s", e)
 
-# ─────────────── АНКЕТА /rent
+        # 2) Chat Completions fallback
+        try:
+            resp2 = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": (user_text or "").strip()},
+                ],
+                max_tokens=450,
+                timeout=45,
+            )
+            txt2 = (resp2.choices[0].message.content or "").strip()
+            if txt2:
+                return sanitize_competitors(txt2)
+        except Exception as e2:
+            log.warning("OpenAI chat.completions.create failed: %s", e2)
+
+        # 3) Локальный ответ (чтобы пользователь не видел «Упс…»)
+        loc = local_weather_reply(user_text)
+        if loc:
+            return loc
+
+        return "Могу помочь с этим. Расскажите, пожалуйста, что именно интересует — отвечу подробно."
+    except (RateLimitError, APIStatusError, APIConnectionError) as e:
+        log.error("OpenAI API error: %s", e)
+        return local_weather_reply(user_text) or None
+    except Exception as e:
+        log.exception("OpenAI unexpected error")
+        return local_weather_reply(user_text) or None
+
+# ───────────────────── Анкета /rent
 def _lead_signature(form: dict) -> tuple:
     return (
         (form.get("type") or "").strip().lower(),
@@ -362,14 +411,12 @@ async def rent_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHECKIN
 
 async def rent_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val_raw = (update.message.text or "").strip()
-    context.user_data["form"]["checkin"] = parse_to_iso_date(val_raw)
+    context.user_data["form"]["checkin"] = parse_to_iso_date((update.message.text or "").strip())
     await update.message.reply_text("6/7. Дата выезда?")
     return CHECKOUT
 
 async def rent_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val_raw = (update.message.text or "").strip()
-    context.user_data["form"]["checkout"] = parse_to_iso_date(val_raw)
+    context.user_data["form"]["checkout"] = parse_to_iso_date((update.message.text or "").strip())
     await update.message.reply_text("7/7. Важные условия? (близость к пляжу, с питомцами, парковка и т.п.)")
     return NOTES
 
@@ -378,12 +425,11 @@ async def rent_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     form = context.user_data["form"]
     lead = Lead.from_context(update, form)
 
-    # Подборки по каналам
     proposed_pairs = build_channel_search_links(form.get("area",""), form.get("bedrooms",""), form.get("budget",""))
     proposed_text_for_sheet = format_links_md(proposed_pairs)
     proposed_count = len(proposed_pairs)
 
-    # Анти-дубликаты (15 минут)
+    # анти-дубликат
     sig = _lead_signature(form)
     last_leads = context.application.bot_data.get("last_leads", {})
     now_ts = int(time.time())
@@ -401,10 +447,8 @@ async def rent_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_leads[update.effective_user.id] = (sig, now_ts)
         context.application.bot_data["last_leads"] = last_leads
 
-    # Флаг — форму прошёл (после этого новые заявки автоматически не создаются)
     context.user_data["rental_form_completed"] = True
 
-    # Ответ пользователю
     human_links = "\n".join([f"• {t}: {u}" for t,u in proposed_pairs]) or "—"
     msg_user, kb = build_cta_with_manager()
     msg_user = (
@@ -420,22 +464,28 @@ async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Окей, если передумаете — пишите /rent.")
     return ConversationHandler.END
 
-# ─────────────── Свободный чат (GPT + умный CTA)
+# ───────────────────── Свободный чат
 async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    1) Всегда отвечаем GPT на любой текст.
-    2) Если тема затрагивает недвижимость — ДОБАВЛЯЕМ наш CTA (а не заменяем ответ).
-    3) После прохождения анкеты показываем кнопку менеджера, до — без неё.
-    """
     user_text = update.effective_message.text or ""
     completed = bool(context.user_data.get("rental_form_completed", False))
 
-    # Ответ GPT
-    gpt_reply = (await call_gpt(user_text)).strip()
+    gpt_reply = await call_gpt(user_text)
+    if gpt_reply is None:
+        # полный сетевой сбой — даём мягкий ответ и CTA, чтобы диалог не “падал”
+        base = local_weather_reply(user_text) or "Я на связи. Готов помочь с любыми вопросами!"
+        if looks_like_realty_question(user_text):
+            cta_msg, cta_kb = (build_cta_with_manager() if completed else build_cta_public())
+            tail = (
+                "\n\n🔧 Самый действенный способ — пройти короткую анкету командой /rent. "
+                f"{'Менеджер уже в курсе и свяжется с вами.' if completed else 'Менеджер получит вашу заявку и свяжется.'}"
+            )
+            await update.effective_message.reply_text(base + tail + "\n\n" + cta_msg,
+                                                      reply_markup=cta_kb, disable_web_page_preview=True)
+        else:
+            await update.effective_message.reply_text(base, disable_web_page_preview=True)
+        return
 
-    # Нужно ли прикрепить CTA?
     need_cta = looks_like_realty_question(user_text) or looks_like_realty_question(gpt_reply)
-
     if need_cta:
         cta_msg, cta_kb = (build_cta_with_manager() if completed else build_cta_public())
         tail = (
@@ -445,12 +495,10 @@ async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         final_text = f"{gpt_reply}{tail}\n\n{cta_msg}"
         await update.effective_message.reply_text(final_text, reply_markup=cta_kb, disable_web_page_preview=True)
-        return
+    else:
+        await update.effective_message.reply_text(gpt_reply, disable_web_page_preview=True)
 
-    # Не про недвижимость — чистый ответ модели
-    await update.effective_message.reply_text(gpt_reply, disable_web_page_preview=True)
-
-# ─────────────── Служебные команды
+# ───────────────────── Служебные команды
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(START_TEXT)
 
@@ -463,19 +511,37 @@ async def cmd_groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Group chat ID: {update.effective_chat.id}")
 
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    openai_set = bool(os.getenv("OPENAI_API_KEY"))
-    sheets_id = os.getenv("GOOGLE_SHEETS_DB_ID") or "—"
-    group_id  = os.getenv("GROUP_CHAT_ID") or str(GROUP_CHAT_ID or "—")
+    # Мини-диагностика OpenAI (делаем безопасно)
+    openai_status = "NOT SET"
+    err = None
+    try:
+        if os.getenv("OPENAI_API_KEY"):
+            client = _get_openai()
+            try:
+                r = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role":"system","content":"Say OK"}],
+                    max_tokens=3,
+                    timeout=15,
+                )
+                openai_status = "OK" if (r.choices and r.choices[0].message.content) else "EMPTY"
+            except Exception as e:
+                err = str(e)
+                openai_status = "ERROR"
+    except Exception as e:
+        err = str(e)
+        openai_status = "ERROR(init)"
+
     txt = (
         "🔎 Диагностика:\n"
-        f"• OPENAI_API_KEY: {'OK' if openai_set else 'MISSING'}\n"
-        f"• GOOGLE_SHEETS_DB_ID: {sheets_id}\n"
-        f"• GROUP_CHAT_ID: {group_id}\n"
+        f"• OPENAI: {openai_status}{(' — ' + err) if err else ''}\n"
+        f"• GOOGLE_SHEETS_DB_ID: {os.getenv('GOOGLE_SHEETS_DB_ID') or '—'}\n"
+        f"• GROUP_CHAT_ID: {os.getenv('GROUP_CHAT_ID') or str(GROUP_CHAT_ID or '—')}\n"
         f"• WEBHOOK_BASE: {os.getenv('WEBHOOK_BASE') or os.getenv('RENDER_EXTERNAL_URL') or '—'}"
     )
     await update.message.reply_text(txt)
 
-# ─────────────── Webhook utils
+# ───────────────────── Webhook utils
 def preflight_release_webhook(token: str):
     base = f"https://api.telegram.org/bot{token}"
     try:
@@ -484,11 +550,11 @@ def preflight_release_webhook(token: str):
     except Exception as e:
         log.warning("deleteWebhook error: %s", e)
 
-# ─────────────── Bootstrap
+# ───────────────────── Bootstrap
 def build_application() -> Application:
     token = env_required("TELEGRAM_BOT_TOKEN")
 
-    # Sheets (опционально)
+    # Sheets
     sheet_id  = os.getenv("GOOGLE_SHEETS_DB_ID")
     sheet_name = os.getenv("GOOGLE_SHEETS_SHEET_NAME", "Leads")
     sheets = SheetsClient(sheet_id=sheet_id, sheet_name=sheet_name)
@@ -503,7 +569,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("groupid", cmd_groupid))
     app.add_handler(CommandHandler("diag", cmd_diag))
 
-    # Анкета /rent
+    # Анкета
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_start)],
         states={
@@ -519,7 +585,7 @@ def build_application() -> Application:
     )
     app.add_handler(conv)
 
-    # ВАЖНО: никаких других “заглушек” выше — свободный чат всегда в конце.
+    # Свободный чат — обязательно последним
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_handler))
     return app
 
@@ -533,7 +599,7 @@ def main():
     app = build_application()
 
     port = int(os.getenv("PORT", "10000"))
-    url_path = token  # токен не светим в URL браузера, только внутри Render
+    url_path = token  # токен используем как часть пути
     webhook_url = f"{base_url.rstrip('/')}/webhook/{url_path}"
 
     log.info("Starting webhook on 0.0.0.0:%s | url=%s", port, webhook_url)
