@@ -4,4 +4,5 @@ google-auth==2.31.0
 cachetools==5.4.0
 oauthlib==3.2.2
 requests==2.32.3
-openai>=1.40.0
+openai==1.40.0
+python-dateutil==2.9.0.post0
