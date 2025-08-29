@@ -1,7 +1,12 @@
-# main.py — Cozy Asia Bot (ptb v20+, WEBHOOK for Render Web Service)
-# Анкета /rent -> Google Sheets, редиректор на свои ресурсы,
-# контакт менеджера только ПОСЛЕ анкеты, дублирование заявок в личку и (опц.) группу,
-# webhook с биндингом на $PORT (Render), health-check "/".
+# main.py — Cozy Asia Bot (python-telegram-bot v20+, WEBHOOK для Render Web Service)
+# Функции:
+# - /start с твоим новым приветствием
+# - /rent анкета -> запись в Google Sheets -> открыть контакт менеджера
+# - Перехват любых упоминаний недвижимости -> вести на твои ресурсы
+# - НИКОГДА не советует другие агентства/FB-группы/агрегаторы
+# - Дублирование заявок менеджеру (личка) и в рабочую группу (если задана)
+# - /id и /groupid для получения Chat ID
+# - Webhook: биндимся на 0.0.0.0:$PORT, URL = WEBHOOK_BASE/webhook/<BOT_TOKEN>
 
 import os
 import json
@@ -16,27 +21,33 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 
-# ── ЛОГИ ─────────────────────────────────────────────────────────────────────
+# ────────────────────────── ЛОГИ
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("cozyasia-bot")
 
-# ── КОНСТАНТЫ ССЫЛОК (твои данные) ──────────────────────────────────────────
+# ────────────────────────── ТВОИ ССЫЛКИ/КОНТАКТЫ
 WEBSITE_URL       = "https://www.cozy-asiath.com/"
 TG_CHANNEL_MAIN   = "https://t.me/SamuiRental"
 TG_CHANNEL_VILLAS = "https://t.me/arenda_vill_samui"
 INSTAGRAM_URL     = "https://www.instagram.com/cozy.asia?igsh=cmt1MHA0ZmM3OTRu"
 
-# Менеджер (контакт показываем ТОЛЬКО ПОСЛЕ анкеты):
+# менеджер: ссылку показываем ТОЛЬКО ПОСЛЕ анкеты
 MANAGER_TG_URL  = "https://t.me/cozy_asia"   # @Cozy_asia
-MANAGER_CHAT_ID = 5978240436                 # Cozy Asia manager
+MANAGER_CHAT_ID = 5978240436                 # Cozy Asia manager (личка)
 
-# Рабочая группа (подставь свой -100… когда узнаешь, можно оставить None)
-GROUP_CHAT_ID = None  # например: -1001234567890123
+# рабочая группа (можно задать числом тут или через ENV GROUP_CHAT_ID=-100…)
+GROUP_CHAT_ID = None
+_env_group = os.getenv("GROUP_CHAT_ID")
+if _env_group:
+    try:
+        GROUP_CHAT_ID = int(_env_group)
+    except Exception:
+        log.warning("GROUP_CHAT_ID из ENV не int: %r", _env_group)
 
-# ── ПРИВЕТСТВИЕ ──────────────────────────────────────────────────────────────
+# ────────────────────────── ПРИВЕТСТВИЕ
 START_TEXT = (
     "✅ Я уже тут!\n"
     "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
@@ -45,11 +56,11 @@ START_TEXT = (
     "Он свяжется с вами для уточнения деталей и бронирования."
 )
 
-# ── КНОПКИ / CTA ─────────────────────────────────────────────────────────────
+# ────────────────────────── КНОПКИ/CTA
 def build_cta_public() -> tuple[str, InlineKeyboardMarkup]:
     kb = [
         [InlineKeyboardButton("🌐 Открыть сайт", url=WEBSITE_URL)],
-        [InlineKeyboardButton("📣 Наш Telegram-канал (все лоты)", url=TG_CHANNEL_MAIN)],
+        [InlineKeyboardButton("📣 Телеграм-канал (все лоты)", url=TG_CHANNEL_MAIN)],
         [InlineKeyboardButton("🏡 Канал по виллам", url=TG_CHANNEL_VILLAS)],
         [InlineKeyboardButton("📷 Instagram", url=INSTAGRAM_URL)],
     ]
@@ -71,7 +82,7 @@ def build_cta_with_manager() -> tuple[str, InlineKeyboardMarkup]:
         msg += "\n\n👤 Контакт менеджера открыт ниже."
     return msg, kb
 
-# ── БЛОКИРОВАТЕЛЬ «советов конкурентов» ─────────────────────────────────────
+# ────────────────────────── ЗАПРЕТ «советов конкурентов»
 BLOCK_PATTERNS = (
     "местных агентств","других агентств","на facebook","в группах facebook",
     "агрегаторах","marketplace","airbnb","booking","renthub","fazwaz",
@@ -86,7 +97,7 @@ def sanitize_competitors(text: str) -> str:
         return "Чтобы не тратить время на сторонние площадки, лучше сразу к нам.\n\n" + msg
     return text
 
-# ── РЕАЛТИ-ТРИГГЕРЫ ──────────────────────────────────────────────────────────
+# ────────────────────────── Триггеры «недвижимости»
 REALTY_KEYWORDS = {
     "аренда","сдать","сниму","снять","дом","вилла","квартира","комнаты","спальни",
     "покупка","купить","продажа","продать","недвижимость","кондо","condo","таунхаус",
@@ -97,7 +108,7 @@ def mentions_realty(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in REALTY_KEYWORDS)
 
-# ── АНКЕТА /rent ─────────────────────────────────────────────────────────────
+# ────────────────────────── АНКЕТА /rent
 TYPE, BUDGET, AREA, BEDROOMS, NOTES = range(5)
 
 async def rent_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,12 +155,12 @@ async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Окей, если передумаете — пишите /rent.")
     return ConversationHandler.END
 
-# ── GOOGLE SHEETS ────────────────────────────────────────────────────────────
+# ────────────────────────── Google Sheets
 # ENV:
 #   TELEGRAM_BOT_TOKEN
-#   GOOGLE_SERVICE_ACCOUNT_JSON  (полный JSON ключа)
+#   GOOGLE_SERVICE_ACCOUNT_JSON  (полный JSON ключ в одну строку)
 #   GOOGLE_SHEETS_DB_ID
-#   GOOGLE_SHEETS_SHEET_NAME (опц., 'Leads' по умолчанию)
+#   GOOGLE_SHEETS_SHEET_NAME (необяз., по умолчанию 'Leads')
 async def write_lead_to_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE, form: dict):
     sheet_id = os.getenv("GOOGLE_SHEETS_DB_ID")
     if not sheet_id:
@@ -203,7 +214,7 @@ async def write_lead_to_sheets(update: Update, context: ContextTypes.DEFAULT_TYP
         log.exception("Sheets write failed: %s", e)
         return False, None
 
-# ── УВЕДОМЛЕНИЯ КОМАНДЕ ─────────────────────────────────────────────────────
+# ────────────────────────── Уведомления команде
 async def notify_staff(update: Update, context: ContextTypes.DEFAULT_TYPE, form: dict, row_url: str | None):
     text = (
         "🆕 Новая заявка Cozy Asia\n\n"
@@ -219,7 +230,7 @@ async def notify_staff(update: Update, context: ContextTypes.DEFAULT_TYPE, form:
     if row_url:
         text += f"\n🗂 Таблица: {row_url}"
 
-    for chat_id in [MANAGER_CHAT_ID, GROUP_CHAT_ID]:
+    for chat_id in (MANAGER_CHAT_ID, GROUP_CHAT_ID):
         if not chat_id:
             continue
         try:
@@ -227,11 +238,11 @@ async def notify_staff(update: Update, context: ContextTypes.DEFAULT_TYPE, form:
         except Exception as e:
             log.warning("Notify failed for %s: %s", chat_id, e)
 
-# ── GPT-фолбэк (заглушка) ───────────────────────────────────────────────────
+# ────────────────────────── GPT-заглушка (с политикой)
 async def call_gpt(user_text: str) -> str:
     return "Готов помочь. По вопросам недвижимости лучше сразу у нас — жмите /rent или смотрите ссылки ниже."
 
-# ── СВОБОДНЫЙ ЧАТ ───────────────────────────────────────────────────────────
+# ────────────────────────── Свободный чат (ловим realty)
 async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text or ""
     completed = bool(context.user_data.get("rental_form_completed", False))
@@ -244,44 +255,38 @@ async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = sanitize_competitors(await call_gpt(text))
     await update.effective_message.reply_text(reply, disable_web_page_preview=True)
 
-# ── СЛУЖЕБНЫЕ КОМАНДЫ ───────────────────────────────────────────────────────
+# ────────────────────────── Служебные команды
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(START_TEXT)
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Ваш Chat ID: {update.effective_chat.id}\nВаш User ID: {update.effective_user.id}")
+    await update.message.reply_text(
+        f"Ваш Chat ID: {update.effective_chat.id}\nВаш User ID: {update.effective_user.id}"
+    )
 
 async def cmd_groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Group chat ID: {update.effective_chat.id}")
 
-# ── PREFLIGHT (опционально для миграций) ────────────────────────────────────
-def preflight_release_slot(token: str, attempts: int = 3):
+# ────────────────────────── Preflight (опционально)
+def preflight_release_slot(token: str, attempts: int = 2):
+    # Для webhook не обязателен, но безопасно сбросит старый вебхук/очередь
     base = f"https://api.telegram.org/bot{token}"
     try:
         requests.post(f"{base}/deleteWebhook", params={"drop_pending_updates": True}, timeout=10)
-        logging.info("deleteWebhook -> OK")
+        log.info("deleteWebhook -> OK")
     except Exception as e:
-        logging.warning("deleteWebhook error: %s", e)
-    # Для webhook это не обязательно, но не мешает.
+        log.warning("deleteWebhook error: %s", e)
 
-# ── MAIN (WEBHOOK) ──────────────────────────────────────────────────────────
+# ────────────────────────── MAIN (WEBHOOK для Render)
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
 
-    # БАЗОВЫЙ ПУБЛИЧНЫЙ URL сервиса (в Render возьми из Dashboard)
-    # Пример: https://telegram-gpt-consultant-d4yn.onrender.com
-    base_url = os.getenv("WEBHOOK_BASE")
+    # Публичный https URL сервиса (Render)
+    base_url = os.getenv("WEBHOOK_BASE") or os.getenv("RENDER_EXTERNAL_URL")
     if not base_url:
-        # Fallback для Render: некоторые планы прокидывают RENDER_EXTERNAL_URL
-        base_url = os.getenv("RENDER_EXTERNAL_URL")
-    if not base_url:
-        raise RuntimeError("WEBHOOK_BASE (или RENDER_EXTERNAL_URL) не задан. Укажи публичный https URL сервиса.")
+        raise RuntimeError("WEBHOOK_BASE (или RENDER_EXTERNAL_URL) не задан.")
 
-    # Health-check для Render
-    # (PTB заведёт aiohttp-сервер сам, корень '/' отдаст 200 OK)
-    # Если хочешь явный answer '/', можно подключить aiohttp вручную — но PTB достаточно.
-
-    preflight_release_slot(token)  # сброс старого вебхука/очереди
+    preflight_release_slot(token)
 
     app = ApplicationBuilder().token(token).build()
 
@@ -307,9 +312,9 @@ def main():
     # Свободный чат
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_handler))
 
-    # Параметры webhook для Render Web Service
-        port = int(os.getenv("PORT", "10000"))     # Render даёт $PORT
-    url_path = token                            # путь = токен (секретный)
+    # Webhook binding
+    port = int(os.getenv("PORT", "10000"))   # Render подставляет $PORT
+    url_path = token                         # секретный путь (токен)
     webhook_url = f"{base_url.rstrip('/')}/webhook/{url_path}"
 
     logging.info(f"Starting webhook on 0.0.0.0:{port}, url={webhook_url}")
@@ -317,11 +322,11 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=f"webhook/{url_path}",         # <-- оставляем только url_path
-        webhook_url=webhook_url,                # <-- публичный URL
-        # secret_token=os.getenv("WEBHOOK_SECRET"),  # если захочешь
+        url_path=f"webhook/{url_path}",   # путь сервера
+        webhook_url=webhook_url,          # публичный URL для Telegram
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
+
 if __name__ == "__main__":
     main()
