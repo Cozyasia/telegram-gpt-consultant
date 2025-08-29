@@ -1,374 +1,372 @@
-# main.py (safe & stable)
 import os
 import json
 import logging
-import datetime as dt
-from typing import Dict, Any, Optional
+from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
-    CallbackContext, filters
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    CallbackContext,
+    filters,
+)
+from dateutil import parser as dtparser
+import requests
 
-# ---------- logging ----------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("cozyasia")
+# ==== ЛОГИ ====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("cozyasia-bot")
 
-# ---------- ENV ----------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-BASE_URL       = (os.getenv("BASE_URL") or os.getenv("WEBHOOK_BASE") or "").rstrip("/")
-WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/webhook").rstrip("/")
+
+# ==== ENV ====
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "").rstrip("/")
 PORT           = int(os.getenv("PORT", "10000"))
-GROUP_CHAT_ID  = int(os.getenv("GROUP_CHAT_ID", "0"))
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY_V1", "").strip()
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_PROJECT = os.getenv("OPENAI_PROJECT")
 
-GS_JSON        = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # raw JSON
-GS_SHEET_ID    = os.getenv("GOOGLE_SHEETS_DB_ID")
-LEADS_SHEET    = os.getenv("GOOGLE_SHEETS_LEADS_SHEET", "Leads")
+GROUP_CHAT_ID  = os.getenv("GROUP_CHAT_ID", "").strip()  # например "-4908974521"
+SHEET_ID       = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_CREDS   = os.getenv("GOOGLE_CREDENTIALS", "").strip()  # JSON service account
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("ENV TELEGRAM_TOKEN is required")
-if not BASE_URL:
-    raise RuntimeError("ENV BASE_URL (or WEBHOOK_BASE) is required")
+# Ссылки на твои ресурсы
+LINK_SITE      = os.getenv("LINK_SITE", "https://cozy.asia")
+LINK_FEED      = os.getenv("LINK_FEED", "https://t.me/SamuiRental")
+LINK_VILLAS    = os.getenv("LINK_VILLAS", "https://t.me/arenda_vill_samui")
+LINK_IG        = os.getenv("LINK_IG", "https://www.instagram.com/cozy.asia")
 
-# ---------- OpenAI (лениво, с безопасностью) ----------
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-def get_oa():
-    if not (OpenAI and OPENAI_API_KEY):
-        return None
-    try:
-        return OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT) if OPENAI_PROJECT else OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        log.exception("OpenAI init failed: %s", e)
-        return None
-
-oa_client = get_oa()
-
-# ---------- Dates ----------
-try:
-    import dateutil.parser as dparser
-    _HAS_DATEUTIL = True
-except Exception:
-    _HAS_DATEUTIL = False
-
-def parse_date_loose(text: str) -> Optional[str]:
-    text = (text or "").strip()
-    if not text:
-        return None
-    if _HAS_DATEUTIL:
-        try:
-            d = dparser.parse(text, dayfirst=True, fuzzy=True)
-            return d.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    formats = [
-        "%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y",
-        "%m/%d/%Y", "%m-%d-%Y", "%Y.%m.%d", "%Y/%m/%d",
-        "%d.%m.%y", "%d-%m-%y", "%Y%m%d"
-    ]
-    for f in formats:
-        try:
-            d = dt.datetime.strptime(text, f)
-            return d.strftime("%Y-%m-%d")
-        except Exception:
-            continue
-    return None
-
-# ---------- Google Sheets (лениво и безопасно) ----------
-_gsready = None
-def _get_ws_safe():
-    """Возвращает (ws, err_msg). Если что-то не так — (None, 'причина')."""
-    global _gsready
-    if _gsready is False:
-        return None, "disabled"
-    try:
-        import gspread
-    except Exception as e:
-        _gsready = False
-        return None, f"gspread import failed: {e}"
-
-    if not GS_JSON or not GS_SHEET_ID:
-        _gsready = False
-        return None, "GS env missing"
-
-    try:
-        creds = json.loads(GS_JSON)
-    except Exception as e:
-        _gsready = False
-        return None, f"bad JSON: {e}"
-
-    try:
-        gc = gspread.service_account_from_dict(creds)
-        sh = gc.open_by_key(GS_SHEET_ID)
-        try:
-            ws = sh.worksheet(LEADS_SHEET)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=LEADS_SHEET, rows=2000, cols=20)
-            ws.append_row([
-                "created_at","chat_id","username",
-                "location","bedrooms","budget",
-                "people","pets",
-                "check_in","check_out",
-                "notes","type"
-            ])
-        _gsready = True
-        return ws, None
-    except Exception as e:
-        _gsready = False
-        return None, f"gspread init failed: {e}"
-
-def save_lead_to_sheet_safe(lead: Dict[str, Any]):
-    ws, err = _get_ws_safe()
-    if not ws:
-        log.warning("Sheets disabled -> %s", err)
-        return
-    try:
-        headers = ws.row_values(1)
-        need = ["created_at","chat_id","username","location","bedrooms","budget","people","pets","check_in","check_out","notes","type"]
-        if not headers:
-            ws.append_row(need)
-            headers = need
-        # Добавим отсутствующие колонки, если нужно
-        missing = [h for h in need if h not in headers]
-        if missing:
-            ws.update([headers + missing], '1:1')
-            headers = ws.row_values(1)
-
-        row = []
-        for h in headers:
-            v = lead.get(h, "")
-            if isinstance(v, (dt.date, dt.datetime)):
-                v = v.strftime("%Y-%m-%d")
-            row.append(v)
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:
-        log.exception("Sheets append failed: %s", e)
-
-# ---------- Общие тексты ----------
-def links_kb() -> InlineKeyboardMarkup:
+# Быстрые кнопки под подсказкой
+def promo_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Открыть сайт", url="https://cozy.asia")],
-        [InlineKeyboardButton("📣 Телеграм-канал (все лоты)", url="https://t.me/SamuiRental")],
-        [InlineKeyboardButton("🏡 Канал по виллам", url="https://t.me/arenda_vill_samui")],
-        [InlineKeyboardButton("📷 Instagram", url="https://www.instagram.com/cozy.asia")],
+        [InlineKeyboardButton("🌐 Открыть сайт", url=LINK_SITE)],
+        [InlineKeyboardButton("📣 Телеграм-канал (все лоты)", url=LINK_FEED)],
+        [InlineKeyboardButton("🏡 Канал по виллам", url=LINK_VILLAS)],
+        [InlineKeyboardButton("📷 Instagram", url=LINK_IG)],
     ])
 
-PROMO = (
-    "🔧 Самый действенный способ — пройти короткую анкету /rent.\n"
-    "Я сделаю подборку лотов по вашим критериям и передам менеджеру.\n\n"
-    "• Сайт: https://cozy.asia\n"
-    "• Канал с лотами: https://t.me/SamuiRental\n"
-    "• Канал по виллам: https://t.me/arenda_vill_samui\n"
-    "• Instagram: https://www.instagram.com/cozy.asia"
-)
 
-SYSTEM_PROMPT = (
-    "Ты дружелюбный эксперт по Самуи и жилью. Давай практичные ответы (климат, сезоны, ветра по пляжам, районы, быт). "
-    "Если разговор уходит к аренде/покупке, мягко направляй на ресурсы Cozy Asia и /rent. "
-    "Не советуй сторонние агентства."
-)
-
-# ---------- GPT ----------
-async def gpt_reply(text: str) -> str:
-    if not oa_client:
-        return "Я на связи: расскажу про погоду, ветра и районы. По жилью — лучше заполнить /rent.\n\n" + PROMO
+# ==== УТИЛИТЫ ====
+def parse_date_human(s: str) -> Optional[str]:
+    """
+    Принимает даты в любом популярном виде: 01.12.2025, 2025-12-01, 1/12/25, 1 янв 2026 и т.п.
+    Возвращает YYYY-MM-DD либо None.
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
     try:
-        resp = oa_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role":"system","content":SYSTEM_PROMPT},
-                {"role":"user","content":text}
-            ],
-            temperature=0.5
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        if not out:
-            out = "Могу помочь с погодой, ветром, районами и жильём."
-        return out + "\n\n👉 По жилью быстрее всего заполнить /rent — подберу лоты и передам менеджеру."
+        dt = dtparser.parse(s, dayfirst=True, fuzzy=True)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def safe_post_to_group(text: str, app: Application) -> None:
+    if not GROUP_CHAT_ID:
+        return
+    try:
+        app.bot.send_message(chat_id=int(GROUP_CHAT_ID), text=text, disable_web_page_preview=True)
     except Exception as e:
-        log.exception("OpenAI error: %s", e)
-        return "Отвечу на любые вопросы. Если речь о жилье — жмите /rent или смотрите ссылки ниже.\n\n" + PROMO
+        log.warning("Cannot post to group: %s", e)
 
-# ---------- Анкета ----------
-(Q_TYPE, Q_BUDGET, Q_AREA, Q_BEDS, Q_IN, Q_OUT, Q_NOTES) = range(7)
 
-def hello_text():
+def openai_chat(messages: list[Dict[str, str]]) -> str:
+    """
+    Простой вызов OpenAI Responses API без сторонних SDK (чтобы не ловить несовместимости).
+    """
+    if not OPENAI_API_KEY:
+        return "Сейчас не могу достучаться до модели ИИ. Напишите /rent, а также смотрите ссылки ниже."
+    try:
+        url = "https://api.openai.com/v1/chat/completions"
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+        }
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        res = requests.post(url, headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error("OpenAI error: %s", e)
+        return "Похоже, ИИ сейчас недоступен. Я всё равно могу помочь: нажмите /rent или откройте ссылки ниже."
+
+
+# ==== GOOGLE SHEETS ====
+def sheets_append(row: Dict[str, Any]) -> None:
+    """
+    Пишем строку лида в Google Sheets (в шит 'Leads').
+    Никак не валим бот, если что-то не настроено — просто лог и всё.
+    """
+    if not (SHEET_ID and GOOGLE_CREDS):
+        log.info("Sheets disabled: no SHEET_ID or GOOGLE_CREDENTIALS")
+        return
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        creds_dict = json.loads(GOOGLE_CREDS)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet("Leads")
+
+        values = [
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            str(row.get("chat_id", "")),
+            str(row.get("username", "")),
+            str(row.get("type", "")),
+            str(row.get("area", "")),
+            str(row.get("bedrooms", "")),
+            str(row.get("budget", "")),
+            str(row.get("checkin", "")),
+            str(row.get("checkout", "")),
+            str(row.get("notes", "")),
+        ]
+        ws.append_row(values, value_input_option="RAW")
+        log.info("Lead appended to sheet")
+    except Exception as e:
+        log.warning("Sheets append failed: %s", e)
+
+
+# ==== СОСТОЯНИЯ ОПРОСНИКА ====
+(
+    Q_TYPE,
+    Q_BUDGET,
+    Q_AREA,
+    Q_BEDS,
+    Q_CHECKIN,
+    Q_CHECKOUT,
+    Q_NOTES,
+) = range(7)
+
+def start_text() -> str:
     return (
-        "✅ Я уже тут!\n"
-        "🌴 Можете спросить меня о пребывании на Самуи — подскажу и помогу.\n\n"
-        "👉 Или нажмите /rent — задам вопросы, сформирую заявку и передам менеджеру."
+        "🖐️ Привет! Добро пожаловать в «Cozy Asia Real Estate Bot»\n\n"
+        "😊 Я твой ИИ помощник и консультант. Со мной можно говорить так же свободно, как с человеком.\n\n"
+        "❓ Задавай вопросы:\n"
+        "🏡 про дома, виллы и квартиры на Самуи\n"
+        "🌴 про жизнь на острове, районы, атмосферу и погоду\n"
+        "🍹 про быт, отдых и куда сходить на острове\n\n"
+        "🔧 Самый действенный способ — пройти короткую анкету командой /rent.\n"
+        "Я сделаю подборку лотов по вашим критериям и передам менеджеру."
     )
 
-async def cmd_start(update: Update, _: CallbackContext):
-    await update.effective_chat.send_message(hello_text())
-    await update.effective_chat.send_message(PROMO, reply_markup=links_kb())
+async def cmd_start(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text(start_text(), reply_markup=promo_keyboard())
 
-async def cmd_ping(update: Update, _: CallbackContext):
-    await update.message.reply_text("pong ✅")
+async def cmd_cancel(update: Update, context: CallbackContext) -> int:
+    await update.message.reply_text("Окей, останавливаю анкету. Можно спросить меня что угодно.")
+    return ConversationHandler.END
 
-async def cmd_debug(update: Update, _: CallbackContext):
-    await update.message.reply_text(
-        f"env: webhook={BASE_URL}{WEBHOOK_PATH}/<token> | openai={'on' if oa_client else 'off'} | sheets={'on' if _gsready else 'off or lazy'}"
-    )
 
-async def cmd_cancel(update: Update, context: CallbackContext):
-    context.user_data.clear()
-    await update.message.reply_text("Окей, если передумаете — /rent.")
-
-async def rent_start(update: Update, context: CallbackContext):
-    ud = context.user_data
-    ud.clear()
-    ud["lead"] = {}
-    ud["in_form"] = True
-    await update.message.reply_text("1/7. Какой тип жилья интересует: квартира, дом или вилла?")
+# ==== ОПРОС /rent ====
+async def rent_entry(update: Update, context: CallbackContext) -> int:
+    context.user_data["lead"] = {
+        "chat_id": update.effective_user.id,
+        "username": update.effective_user.username or update.effective_user.full_name,
+    }
+    await update.message.reply_text("Начнём подбор.\n1/7. Какой тип жилья интересует: квартира, дом или вилла?")
     return Q_TYPE
 
-async def q_type(update: Update, context: CallbackContext):
-    context.user_data["lead"]["type"] = update.message.text.strip().title()
-    await update.message.reply_text("2/7. Какой бюджет в батах (месяц)?")
+async def rent_type(update: Update, context: CallbackContext) -> int:
+    context.user_data["lead"]["type"] = update.message.text.strip()
+    await update.message.reply_text("2/7. Какой у вас бюджет в батах (месяц)?")
     return Q_BUDGET
 
-async def q_budget(update: Update, context: CallbackContext):
-    val = "".join(ch for ch in update.message.text if ch.isdigit()) or update.message.text
-    context.user_data["lead"]["budget"] = val
+async def rent_budget(update: Update, context: CallbackContext) -> int:
+    context.user_data["lead"]["budget"] = update.message.text.strip()
     await update.message.reply_text("3/7. В каком районе Самуи предпочтительно жить?")
     return Q_AREA
 
-async def q_area(update: Update, context: CallbackContext):
-    context.user_data["lead"]["location"] = update.message.text.strip().title()
+async def rent_area(update: Update, context: CallbackContext) -> int:
+    context.user_data["lead"]["area"] = update.message.text.strip()
     await update.message.reply_text("4/7. Сколько нужно спален?")
     return Q_BEDS
 
-async def q_beds(update: Update, context: CallbackContext):
-    val = "".join(ch for ch in update.message.text if ch.isdigit()) or update.message.text
-    context.user_data["lead"]["bedrooms"] = val
-    await update.message.reply_text("5/7. Дата заезда? (можно в любом формате)")
-    return Q_IN
+async def rent_beds(update: Update, context: CallbackContext) -> int:
+    context.user_data["lead"]["bedrooms"] = update.message.text.strip()
+    await update.message.reply_text("5/7. Дата заезда (в любом формате, например 01.12.2025)?")
+    return Q_CHECKIN
 
-async def q_in(update: Update, context: CallbackContext):
-    d = parse_date_loose(update.message.text)
-    if not d:
-        await update.message.reply_text("Не понял дату. Попробуйте, например: 01.12.2025 или 2025-12-01.")
-        return Q_IN
-    context.user_data["lead"]["check_in"] = d
-    await update.message.reply_text("6/7. Дата выезда?")
-    return Q_OUT
+async def rent_checkin(update: Update, context: CallbackContext) -> int:
+    dt = parse_date_human(update.message.text)
+    if not dt:
+        await update.message.reply_text("Не распознал дату. Напишите ещё раз (например 2025-12-01).")
+        return Q_CHECKIN
+    context.user_data["lead"]["checkin"] = dt
+    await update.message.reply_text("6/7. Дата выезда (в любом формате, например 01.01.2026)?")
+    return Q_CHECKOUT
 
-async def q_out(update: Update, context: CallbackContext):
-    d = parse_date_loose(update.message.text)
-    if not d:
-        await update.message.reply_text("Не понял дату. Попробуйте, например: 01.01.2026 или 2026-01-01.")
-        return Q_OUT
-    context.user_data["lead"]["check_out"] = d
-    await update.message.reply_text("7/7. Важные условия? (пляж, питомцы, парковка и т.п.)")
+async def rent_checkout(update: Update, context: CallbackContext) -> int:
+    dt = parse_date_human(update.message.text)
+    if not dt:
+        await update.message.reply_text("Не распознал дату. Напишите ещё раз (например 2026-01-01).")
+        return Q_CHECKOUT
+    context.user_data["lead"]["checkout"] = dt
+    await update.message.reply_text("7/7. Важные условия? (близость к пляжу, с питомцами, парковка и т.п.)")
     return Q_NOTES
 
-async def q_notes(update: Update, context: CallbackContext):
-    lead = context.user_data["lead"]
+def format_lead_card(lead: Dict[str, Any], user_mention: str) -> str:
+    return (
+        "🆕 Новая заявка Cozy Asia\n"
+        f"Клиент: {user_mention}\n"
+        f"Тип: {lead.get('type','')}\n"
+        f"Район: {lead.get('area','')}\n"
+        f"Бюджет: {lead.get('budget','')}\n"
+        f"Спален: {lead.get('bedrooms','')}\n"
+        f"Check-in: {lead.get('checkin','')} | Check-out: {lead.get('checkout','')}\n"
+        f"Условия/прим.: {lead.get('notes','')}\n"
+        f"Создано: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+
+async def rent_notes(update: Update, context: CallbackContext) -> int:
+    lead = context.user_data.get("lead", {})
     lead["notes"] = update.message.text.strip()
 
-    user = update.effective_user
-    lead_full = {
-        "created_at": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "chat_id": str(user.id),
-        "username": user.username or "",
-        "location": lead.get("location",""),
-        "bedrooms": lead.get("bedrooms",""),
-        "budget": lead.get("budget",""),
-        "people": "",
-        "pets": "",
-        "check_in": lead.get("check_in",""),
-        "check_out": lead.get("check_out",""),
-        "notes": lead.get("notes",""),
-        "type": lead.get("type",""),
-    }
+    # 1) Пишем в таблицу (без падений)
+    sheets_append({
+        "chat_id": lead.get("chat_id"),
+        "username": lead.get("username"),
+        "type": lead.get("type"),
+        "area": lead.get("area"),
+        "bedrooms": lead.get("bedrooms"),
+        "budget": lead.get("budget"),
+        "checkin": lead.get("checkin"),
+        "checkout": lead.get("checkout"),
+        "notes": lead.get("notes"),
+    })
 
-    # уведомление в рабочую группу
-    if GROUP_CHAT_ID != 0:
-        text = (
-            "🆕 *Новая заявка Cozy Asia*\n"
-            f"Клиент: @{user.username or '—'} (ID: {user.id})\n"
-            f"Тип: {lead_full['type'] or '—'}\n"
-            f"Район: {lead_full['location'] or '—'}\n"
-            f"Бюджет: {lead_full['budget'] or '—'}\n"
-            f"Спален: {lead_full['bedrooms'] or '—'}\n"
-            f"Check-in: {lead_full['check_in'] or '—'} | Check-out: {lead_full['check_out'] or '—'}\n"
-            f"Условия/прим.: {lead_full['notes'] or '—'}\n"
-            f"Создано: {lead_full['created_at']} UTC"
-        )
-        try:
-            await context.bot.send_message(GROUP_CHAT_ID, text, parse_mode="Markdown")
-        except Exception as e:
-            log.exception("Group notify failed: %s", e)
+    # 2) Уведомляем рабочую группу
+    user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.full_name
+    safe_post_to_group(format_lead_card(lead, user_mention), context.application)
 
-    # запись в таблицу (не роняет бота, если что-то не так)
-    try:
-        save_lead_to_sheet_safe(lead_full)
-    except Exception as e:
-        log.exception("Sheet save outer failed: %s", e)
-
-    await update.message.reply_text(
-        "Заявка сформирована ✅ Менеджер в курсе и свяжется.\n"
-        "Сейчас по вашим параметрам подберу варианты.\n\n" + PROMO,
-        reply_markup=links_kb()
+    # 3) Отвечаем пользователю + мягкий переход к свободному чату
+    txt = (
+        "Готово! Заявка сформирована и передана менеджеру ✅\n"
+        "Я также подберу варианты по вашим критериям и пришлю вам. "
+        "Пока можно продолжать свободный разговор — я на связи.\n\n"
+        "Если хотите, нажмите /rent, чтобы отправить ещё одну заявку."
     )
-
-    context.user_data.clear()
-    context.user_data["form_completed"] = True
+    await update.message.reply_text(txt, reply_markup=promo_keyboard())
     return ConversationHandler.END
 
-# свободный чат
-async def on_text(update: Update, context: CallbackContext):
-    if context.user_data.get("in_form"):
-        await update.message.reply_text("Упс, давай закончим вопрос. Или /cancel.")
-        return
-    reply = await gpt_reply(update.message.text)
-    await update.message.reply_text(reply, reply_markup=links_kb())
 
-# ---------- app ----------
-def build_app() -> Application:
+# ==== СВОБОДНЫЙ GPT-ЧАТ ====
+SYSTEM_PROMPT = (
+    "Ты — дружелюбный ассистент Cozy Asia для острова Самуи. Отвечай по делу, кратко и полезно. "
+    "Когда вопрос касается аренды/покупки/продажи или «где посмотреть варианты», не отправляй к сторонним агентствам — "
+    "всегда мягко направляй к нашим ресурсам и предлагай анкету /rent. "
+    "Но при этом отвечай на любые обычные вопросы (погода, пляжи, районы, быт и т.д.)."
+)
+
+def build_messages(user_text: str, username: str) -> list[Dict[str, str]]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Пользователь (@{username}): {user_text}"},
+    ]
+
+async def free_chat(update: Update, context: CallbackContext) -> None:
+    text = update.message.text or ""
+    username = update.effective_user.username or update.effective_user.full_name
+    log.info("TEXT from %s: %s", username, text)
+
+    answer = openai_chat(build_messages(text, username))
+    tail = (
+        "\n\n🔧 Самый действенный способ — пройти короткую анкету /rent. "
+        "Сделаю подборку лотов по вашим критериям и передам менеджеру.\n\n"
+        f"• Сайт: {LINK_SITE}\n"
+        f"• Канал с лотами: {LINK_FEED}\n"
+        f"• Канал по виллам: {LINK_VILLAS}\n"
+        f"• Instagram: {LINK_IG}"
+    )
+    try:
+        await update.message.reply_text(answer + tail, reply_markup=promo_keyboard(), disable_web_page_preview=True)
+    except Exception as e:
+        log.error("Reply error: %s", e)
+
+
+# ==== ОШИБКИ ====
+async def on_error(update: Optional[Update], context: CallbackContext) -> None:
+    log.exception("Exception while handling update: %s", context.error)
+
+
+# ==== ПРИЛОЖЕНИЕ ====
+def build_application() -> Application:
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("ENV TELEGRAM_TOKEN is required")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # Опросник /rent
     conv = ConversationHandler(
-        entry_points=[CommandHandler("rent", rent_start)],
+        entry_points=[CommandHandler("rent", rent_entry)],
         states={
-            Q_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_type)],
-            Q_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_budget)],
-            Q_AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_area)],
-            Q_BEDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_beds)],
-            Q_IN: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_in)],
-            Q_OUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_out)],
-            Q_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_notes)],
+            Q_TYPE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_type)],
+            Q_BUDGET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_budget)],
+            Q_AREA:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_area)],
+            Q_BEDS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_beds)],
+            Q_CHECKIN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_checkin)],
+            Q_CHECKOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_checkout)],
+            Q_NOTES:    [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_notes)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True
+        allow_reentry=True,
+        per_chat=True,
+        per_user=True,
     )
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    # Свободный чат — в самом конце, чтобы ловить всё остальное
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_chat))
+
+    # Ошибки
+    app.add_error_handler(on_error)
     return app
 
-def main():
-    app = build_app()
-    full_url = f"{BASE_URL}{WEBHOOK_PATH}/{TELEGRAM_TOKEN}"
-    log.info("==> run_webhook port=%s url=%s", PORT, full_url)
+
+def main() -> None:
+    app = build_application()
+
+    # Локальный запуск (без вебхука) — на всякий случай
+    if not WEBHOOK_BASE:
+        log.info("Starting long-polling (WEBHOOK_BASE not set)")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+        return
+
+    # Render: вебхук
+    path = f"/webhook/{TELEGRAM_TOKEN}"
+    url = f"{WEBHOOK_BASE}{path}"
+    log.info("=> run_webhook port=%s url=%s", PORT, url)
+
     app.run_webhook(
-        listen="0.0.0.0", port=PORT,
-        webhook_url=full_url,
-        drop_pending_updates=True
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=f"{TELEGRAM_TOKEN}",
+        webhook_url=url,
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False,
     )
+
 
 if __name__ == "__main__":
     main()
