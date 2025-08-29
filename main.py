@@ -1,403 +1,385 @@
 import os
-import re
 import json
-import base64
 import logging
-import asyncio
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional, Tuple
 
-from dateutil import parser as dateparser
+from dateutil import parser as dtparser
+from dateutil.parser import ParserError
 
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton,
+    ReplyKeyboardMarkup
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters,
+    ConversationHandler
 )
 
-# --------- ЛОГИ ---------
+# ====== ЛОГИ ================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("cozyasia-bot")
 
-# --------- КОНСТАНТЫ/ENV ---------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# ====== БЕЗОПАСНОЕ ЧТЕНИЕ ENV =============================================
+def env(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
+    val = os.getenv(name, default)
+    if required and not val:
+        raise RuntimeError(f"ENV {name} is required")
+    return val
 
-# ВАЖНО: указывайте БЕЗ дополнительного пути — только базовый https URL сервиса Render
-# пример: https://telegram-gpt-consultant-d4yn.onrender.com
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").rstrip("/")
+# Обязательные / опциональные переменные
+TELEGRAM_TOKEN   = env("TELEGRAM_TOKEN", required=True)
+OPENAI_API_KEY   = env("OPENAI_API_KEY") or env("OPENAI_API_KEY_SECRET")
+OPENAI_MODEL     = env("OPENAI_MODEL", "gpt-4o-mini")
+GROUP_CHAT_ID    = env("GROUP_CHAT_ID")  # например: -4908974531
+WEBHOOK_BASE     = env("WEBHOOK_BASE", required=True).rstrip("/")
+WEBHOOK_PATH     = env("WEBHOOK_PATH", "/webhook")
+PORT             = int(env("PORT", "10000"))
 
-MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "0") or 0)     # 5978240436
-WORKGROUP_CHAT_ID = int(os.getenv("WORKGROUP_CHAT_ID", "0") or 0) # например: -1001234567890
+# Ресурсы для «маркетингового» блока
+SITE_URL         = env("SITE_URL", "https://cozy.asia")
+TG_CHANNEL_ALL   = env("TG_CHANNEL_ALL", "https://t.me/SamuiRental")
+TG_CHANNEL_VILL  = env("TG_CHANNEL_VILL", "https://t.me/arenda_vill_samui")
+INSTAGRAM_URL    = env("INSTAGRAM_URL", "https://www.instagram.com/cozy.asia")
 
-GOOGLE_SHEETS_DB_ID = os.getenv("GOOGLE_SHEETS_DB_ID", "").strip()
-GOOGLE_SERVICE_JSON_B64 = os.getenv("GOOGLE_SERVICE_JSON_B64", "").strip()
+# Google Sheets (опционально)
+GS_DB_ID         = env("GOOGLE_SHEETS_DB_ID")
+GS_CREDS_JSON    = env("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# Ссылки Cozy Asia
-SITE_URL = "https://cozy.asia"
-TG_CHANNEL_LOTS = "https://t.me/SamuiRental"
-TG_CHANNEL_VILLAS = "https://t.me/arenda_vill_samui"
-INSTAGRAM_URL = "https://www.instagram.com/cozy.asia?igsh=cmt1MHA0ZmM3OTRu"
+# ====== OPENAI ==============================================================
+openai_client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        log.info("OpenAI client ready.")
+    except Exception as e:
+        log.warning("OpenAI init failed: %s", e)
 
-# GPT параметры
-GPT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-GPT_SYSTEM = (
-    "Ты — дружелюбный локальный ассистент Cozy Asia на Самуи. "
-    "Отвечай кратко и по делу. Если вопрос касается климата, быта, районов, транспорта — отвечай сам. "
-    "Если видишь явный интерес к недвижимости (аренда/покупка/продажа домов, вилл, квартир, лоты, цены), "
-    "то дай полезный ответ по сути и добавь короткое приглашение пройти /rent у Cozy Asia (без упоминания сторонних агентств)."
-)
-
-# --------- GOOGLE SHEETS (опционально) ---------
-_gspread = None
-def _init_gspread():
-    global _gspread
-    if _gspread is not None:
-        return _gspread
-    if not (GOOGLE_SHEETS_DB_ID and GOOGLE_SERVICE_JSON_B64):
-        return None
+# ====== GOOGLE SHEETS (опционально) ========================================
+gspread_client = None
+worksheet = None
+if GS_DB_ID and GS_CREDS_JSON:
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-        creds_dict = json.loads(base64.b64decode(GOOGLE_SERVICE_JSON_B64).decode("utf-8"))
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        _gspread = client.open_by_key(GOOGLE_SHEETS_DB_ID).sheet1
-        log.info("Google Sheets connected.")
-        return _gspread
+
+        sa_info = json.loads(GS_CREDS_JSON)
+        creds = Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        gspread_client = gspread.authorize(creds)
+        sh = gspread_client.open_by_key(GS_DB_ID)
+        worksheet = sh.sheet1
+        log.info("Google Sheets ready.")
     except Exception as e:
-        log.warning("Google Sheets init failed: %s", e)
+        log.warning("Google Sheets disabled: %s", e)
+else:
+    log.info("Google Sheets not configured; skipping.")
+
+# ====== ВСПОМОГАТЕЛЬНОЕ ====================================================
+def parse_any_date(text: str) -> Optional[str]:
+    """
+    Пытается распознать дату «в любых разумных форматах».
+    Возвращает ISO 'YYYY-MM-DD' или None.
+    """
+    if not text:
+        return None
+    try:
+        # dayfirst=True помогает для 01.12.2025 и т.п.
+        dt = dtparser.parse(text, dayfirst=True, fuzzy=True)
+        return dt.date().isoformat()
+    except ParserError:
         return None
 
-def gs_append_row(values: List[Any]):
-    sh = _init_gspread()
-    if not sh:
-        return
-    try:
-        sh.append_row(values, value_input_option="USER_ENTERED")
-    except Exception as e:
-        log.warning("GS append error: %s", e)
+def marketing_block() -> Tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "📌 Самый действенный способ — пройти короткую анкету командой /rent.\n"
+        "Я сделаю подборку лотов по вашим критериям и передам менеджеру.\n\n"
+        f"• Сайт: {SITE_URL}\n"
+        f"• Канал с лотами: {TG_CHANNEL_ALL}\n"
+        f"• Канал по виллам: {TG_CHANNEL_VILL}\n"
+        f"• Instagram: {INSTAGRAM_URL}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Открыть сайт", url=SITE_URL)],
+        [InlineKeyboardButton("📣 Телеграм-канал (все лоты)", url=TG_CHANNEL_ALL)],
+        [InlineKeyboardButton("🏡 Канал по виллам", url=TG_CHANNEL_VILL)],
+        [InlineKeyboardButton("📸 Instagram", url=INSTAGRAM_URL)],
+    ])
+    return text, kb
 
-# --------- GPT (OpenAI) ---------
-_client = None
-def _get_openai_client():
-    global _client
-    if _client is None and OPENAI_API_KEY:
-        from openai import OpenAI
-        _client = OpenAI(api_key=OPENAI_API_KEY)
-    return _client
-
-async def gpt_answer(prompt: str) -> str:
+async def gpt_reply(user_text: str) -> str:
     """
-    Асинхронно дергаем OpenAI. Если ключа нет или ошибка — возвращаем безопасный текст,
-    чтобы бот не «падал» и продолжал объяснять пользователю, как получить помощь.
+    Свободное общение. Если OpenAI недоступен — даём локальный фолбэк.
+    К ответу добавляем мягкую маршрутизацию к анкете/ресурсам.
     """
-    client = _get_openai_client()
-    if not client:
-        return ("Сейчас я могу отвечать на общие вопросы. "
-                "По недвижимости — нажмите /rent или посмотрите ссылки ниже.")
+    base_answer = None
 
-    def _call():
+    if openai_client:
         try:
-            resp = client.chat.completions.create(
-                model=GPT_MODEL,
-                messages=[
-                    {"role": "system", "content": GPT_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-                max_tokens=600,
+            sys_prompt = (
+                "Ты дружелюбный русскоязычный помощник Cozy Asia по Самуи: климат, районы, быт, перелёты, визы, "
+                "интересные места, а также базовые советы по подбору жилья. Не упоминай внешних агентств. "
+                "Если вопрос идёт к конкретному подбору/аренде/покупке — мягко предложи пройти анкету /rent и дать ссылки Cozy Asia."
             )
-            return resp.choices[0].message.content.strip()
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_text}
+                ],
+                temperature=0.7,
+                max_tokens=500
+            )
+            base_answer = resp.choices[0].message.content.strip()
         except Exception as e:
             log.warning("OpenAI error: %s", e)
-            return ""
 
-    text = await asyncio.to_thread(_call)
-    if not text:
-        text = ("У меня временно трудности с ИИ-ответом. "
-                "По вопросам недвижимости — команда /rent или кнопки ниже.")
-    return text
+    if not base_answer:
+        # Простой фолбэк, чтобы бот не молчал
+        base_answer = (
+            "Постараюсь помочь. На Самуи — тропический климат: окт–дек чаще дожди и волна на востоке; "
+            "янв–март суше и спокойнее; апрель — жаркий штиль; лето умеренное. "
+            "Задайте вопрос конкретнее, и я уточню. "
+        )
 
-# --------- ПРОМО-БЛОК ---------
-def promo_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Открыть сайт", url=SITE_URL)],
-        [InlineKeyboardButton("📣 Телеграм-канал (все лоты)", url=TG_CHANNEL_LOTS)],
-        [InlineKeyboardButton("🏡 Канал по виллам", url=TG_CHANNEL_VILLAS)],
-        [InlineKeyboardButton("📷 Instagram", url=INSTAGRAM_URL)],
-    ])
+    # Добавим «мягкую воронку»
+    extra, _ = marketing_block()
+    return f"{base_answer}\n\n{extra}"
 
-PROMO_TEXT = (
-    "📝 Самый действенный способ — пройти короткую анкету командой /rent.\n"
-    "Я сделаю подборку лотов по вашим критериям и передам менеджеру."
-)
+def safe_notify_group(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if not GROUP_CHAT_ID:
+        return
+    try:
+        context.application.create_task(
+            context.bot.send_message(chat_id=int(GROUP_CHAT_ID), text=text, parse_mode=ParseMode.HTML)
+        )
+    except Exception as e:
+        log.warning("Notify group failed: %s", e)
 
-REALTY_PATTERNS = re.compile(
-    r"(дом|вил(ла|лы)|квартир|аренд|снять|сда(ч|ё)|купить|продать|лот|цена|бюджет|таунхаус)",
-    re.IGNORECASE
-)
+def write_to_sheet(row: Dict[str, Any]):
+    if not worksheet:
+        return
+    try:
+        values = [
+            row.get("time", ""),
+            row.get("user_id", ""),
+            row.get("username", ""),
+            row.get("type", ""),
+            row.get("area", ""),
+            row.get("budget", ""),
+            row.get("bedrooms", ""),
+            row.get("checkin", ""),
+            row.get("checkout", ""),
+            row.get("notes", ""),
+        ]
+        worksheet.append_row(values)
+    except Exception as e:
+        log.warning("Sheet append failed: %s", e)
 
-# --------- АНКЕТА ---------
+# ====== АНКЕТА /rent ========================================================
 (
-    ST_TYPE,
-    ST_BUDGET,
-    ST_AREA,
-    ST_BEDS,
-    ST_CHECKIN,
-    ST_CHECKOUT,
-    ST_NOTES,
+    RENT_TYPE,
+    RENT_BUDGET,
+    RENT_AREA,
+    RENT_BEDS,
+    RENT_CHECKIN,
+    RENT_CHECKOUT,
+    RENT_NOTES,
 ) = range(7)
 
-def _parse_date_any(s: str) -> Optional[str]:
-    try:
-        dt = dateparser.parse(s, dayfirst=True, yearfirst=False, fuzzy=True)
-        if not dt:
-            return None
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return None
+def reset_form(user_data: Dict[str, Any]):
+    user_data["rent_form"] = {
+        "type": "",
+        "budget": "",
+        "area": "",
+        "bedrooms": "",
+        "checkin": "",
+        "checkout": "",
+        "notes": "",
+        "submitted": False,  # антидубли
+    }
 
-def _msg_application_card(user_mention: str, data: Dict[str, Any], lots_count: int) -> str:
-    return (
-        "🆕 Новая заявка Cozy Asia\n\n"
-        f"Клиент: {user_mention}\n"
-        f"Тип: {data.get('type','')}\n"
-        f"Район: {data.get('area','')}\n"
-        f"Бюджет: {data.get('budget','')}\n"
-        f"Спален: {data.get('beds','')}\n"
-        f"Заезд: {data.get('checkin','')}\n"
-        f"Выезд: {data.get('checkout','')}\n"
-        f"Условия/прим.: {data.get('notes','')}\n"
-        f"Создано: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"Подходящих лотов: {lots_count}\n"
-        f"Каналы для просмотра: {TG_CHANNEL_LOTS} | {TG_CHANNEL_VILLAS}"
+async def rent_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_form(context.user_data)
+    await update.message.reply_text(
+        "Начнём подбор.\n1/7. Какой тип жилья интересует: квартира, дом или вилла?"
     )
+    return RENT_TYPE
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.set_my_commands([
-        BotCommand("start", "Перезапустить"),
-        BotCommand("rent", "Подобрать жильё"),
-        BotCommand("cancel", "Отменить анкету"),
-    ])
-    text = (
-        "✅ Я уже тут!\n"
-        "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n\n"
-        "👉 Или нажмите команду /rent — задам несколько вопросов о жилье, "
-        "сформирую заявку, предложу варианты и передам менеджеру. "
-        "Он свяжется с вами для уточнения."
-    )
-    await update.message.reply_text(text)
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("form", None)
-    context.user_data.pop("form_done", None)
-    await update.message.reply_text("Окей, если передумаете — пишите /rent.")
-    return ConversationHandler.END
-
-# -- Анкета: шаги --
-async def rent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["form"] = {}
-    return await rent_ask_type(update, context)
-
-async def rent_ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("1/7. Какой тип жилья интересует: квартира, дом или вилла?")
-    return ST_TYPE
-
-async def rent_get_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["form"]["type"] = update.message.text.strip()
+async def rent_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["rent_form"]["type"] = update.message.text.strip()
     await update.message.reply_text("2/7. Какой у вас бюджет в батах (месяц)?")
-    return ST_BUDGET
+    return RENT_BUDGET
 
-async def rent_get_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["form"]["budget"] = update.message.text.strip()
+async def rent_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["rent_form"]["budget"] = update.message.text.strip()
     await update.message.reply_text("3/7. В каком районе Самуи предпочтительно жить?")
-    return ST_AREA
+    return RENT_AREA
 
-async def rent_get_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["form"]["area"] = update.message.text.strip()
+async def rent_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["rent_form"]["area"] = update.message.text.strip()
     await update.message.reply_text("4/7. Сколько нужно спален?")
-    return ST_BEDS
+    return RENT_BEDS
 
-async def rent_get_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["form"]["beds"] = update.message.text.strip()
-    await update.message.reply_text("5/7. Дата заезда? Напишите в свободном формате (например, 1.12.2025).")
-    return ST_CHECKIN
+async def rent_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["rent_form"]["bedrooms"] = update.message.text.strip()
+    await update.message.reply_text("5/7. Дата заезда (любым понятным форматом, например 01.12.2025)?")
+    return RENT_CHECKIN
 
-async def rent_get_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dt = _parse_date_any(update.message.text)
-    if not dt:
-        await update.message.reply_text("Не распознал дату. Напишите по-другому (например, 2025-12-01).")
-        return ST_CHECKIN
-    context.user_data["form"]["checkin"] = dt
-    await update.message.reply_text("6/7. Дата выезда? (любой формат)")
-    return ST_CHECKOUT
+async def rent_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    iso = parse_any_date(update.message.text)
+    if not iso:
+        await update.message.reply_text("Не распознал дату. Напишите ещё раз (например: 2025-12-01 или 01.12.2025).")
+        return RENT_CHECKIN
+    context.user_data["rent_form"]["checkin"] = iso
+    await update.message.reply_text("6/7. Дата выезда (любой формат)?")
+    return RENT_CHECKOUT
 
-async def rent_get_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dt = _parse_date_any(update.message.text)
-    if not dt:
-        await update.message.reply_text("Не распознал дату. Напишите по-другому (например, 2026-01-15).")
-        return ST_CHECKOUT
-    context.user_data["form"]["checkout"] = dt
+async def rent_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    iso = parse_any_date(update.message.text)
+    if not iso:
+        await update.message.reply_text("Не распознал дату. Напишите ещё раз.")
+        return RENT_CHECKOUT
+    context.user_data["rent_form"]["checkout"] = iso
     await update.message.reply_text(
         "7/7. Важные условия? (близость к пляжу, с питомцами, парковка и т.п.)"
     )
-    return ST_NOTES
+    return RENT_NOTES
 
-async def rent_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["form"]["notes"] = update.message.text.strip()
-    data = context.user_data["form"].copy()
-    context.user_data["form_done"] = True  # флаг — анкету закончили
+async def rent_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    form = context.user_data.get("rent_form", {})
+    form["notes"] = update.message.text.strip()
 
-    # «Поиск лотов» (сейчас — заглушка; показываем 0 и даем ваши каналы)
-    lots_count = 0
+    # Антидубли: если уже отправляли — не шлём повторно
+    if not form.get("submitted"):
+        form["submitted"] = True
+        # Уведомим рабочую группу
+        text = (
+            "<b>🆕 Новая заявка Cozy Asia</b>\n"
+            f"Клиент: @{update.effective_user.username or '—'} (ID: {update.effective_user.id})\n"
+            f"Тип: {form['type']}\n"
+            f"Район: {form['area']}\n"
+            f"Бюджет: {form['budget']}\n"
+            f"Спален: {form['bedrooms']}\n"
+            f"Check-in: {form['checkin']}  |  Check-out: {form['checkout']}\n"
+            f"Условия/прим.: {form['notes']}\n"
+            f"Создано: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+        safe_notify_group(context, text)
 
-    # Уведомления менеджеру и в группу
-    mention = f"@{update.effective_user.username}" if update.effective_user.username else f"{update.effective_user.full_name}"
-    card = _msg_application_card(mention, data, lots_count)
+        # Запишем в Google Sheets, если есть
+        write_to_sheet({
+            "time": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            "user_id": str(update.effective_user.id),
+            "username": update.effective_user.username or "",
+            "type": form['type'],
+            "area": form['area'],
+            "budget": form['budget'],
+            "bedrooms": form['bedrooms'],
+            "checkin": form['checkin'],
+            "checkout": form['checkout'],
+            "notes": form['notes'],
+        })
 
-    if MANAGER_CHAT_ID:
-        try:
-            await context.bot.send_message(MANAGER_CHAT_ID, card)
-        except Exception as e:
-            log.warning("Notify manager failed: %s", e)
-    if WORKGROUP_CHAT_ID:
-        try:
-            await context.bot.send_message(WORKGROUP_CHAT_ID, card)
-        except Exception as e:
-            log.warning("Notify workgroup failed: %s", e)
-
-    # Сохранить в Google Sheets (если подключено)
-    try:
-        gs_append_row([
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            update.effective_user.id,
-            update.effective_user.username or "",
-            data.get("type",""), data.get("area",""), data.get("budget",""),
-            data.get("beds",""), data.get("checkin",""), data.get("checkout",""),
-            data.get("notes",""),
-        ])
-    except Exception as e:
-        log.warning("GS write failed: %s", e)
-
-    # Ответ пользователю
-    text = (
-        "Готово! Ваша заявка сформирована и передана менеджеру. "
-        "Скоро он свяжется с вами.\n\n"
-        f"По вашим критериям сейчас нашёл {lots_count} подходящих лотов.\n"
-        "Пока можно посмотреть публикации:\n"
-        f"• Канал с лотами: {TG_CHANNEL_LOTS}\n"
-        f"• Канал по виллам: {TG_CHANNEL_VILLAS}\n"
-        f"• Instagram: {INSTAGRAM_URL}"
+    # Ответ пользователю + авто-рекомендации
+    extra_text, kb = marketing_block()
+    await update.message.reply_text(
+        "Заявка сформирована ✅\n"
+        "Я уже передал детали менеджеру — он свяжется с вами в ближайшее время.\n"
+        "Сейчас подберу варианты по вашей анкете и вышлю ссылки.\n\n"
+        f"{extra_text}",
+        reply_markup=kb
     )
-    await update.message.reply_text(text, reply_markup=promo_keyboard())
     return ConversationHandler.END
 
-# --------- СВОБОДНОЕ ОБЩЕНИЕ ---------
-async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Окей, если передумаете — пишите /rent.")
+    return ConversationHandler.END
 
-    # Если только что закончили анкету — просто чатимся (без повторной отправки заявки)
-    # «Заявка» отправляется ТОЛЬКО внутри rent_finish.
-    try:
-        reply = await gpt_answer(text)
-    except Exception as e:
-        log.warning("free_text gpt error: %s", e)
-        reply = "Я на связи. Готов помочь с любыми вопросами!"
+# ====== /start и свободное общение =========================================
+def make_starter_keyboard() -> InlineKeyboardMarkup:
+    _, kb = marketing_block()
+    return kb
 
-    # Если есть признаки интереса к недвижимости — дополним промо-блоком (но чужих агентств не упоминаем)
-    if REALTY_PATTERNS.search(text):
-        reply += "\n\n" + PROMO_TEXT
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "✅ Я уже тут!\n"
+        "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n\n"
+        "👉 Или нажмите команду /rent — задам несколько вопросов о жилье, сформирую заявку, предложу варианты и передам менеджеру."
+    )
+    await update.message.reply_text(text, reply_markup=make_starter_keyboard())
 
-        await update.message.reply_text(reply, reply_markup=promo_keyboard())
-    else:
-        await update.message.reply_text(reply)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Доступные команды: /start, /rent, /cancel")
 
-# --------- СТАРТ ПРИЛОЖЕНИЯ ---------
-async def setup_webhook(app: Application):
-    """
-    Настраиваем вебхук. В v21 сервер слушает ПУТЬ '/'.
-    Поэтому webhook_url должен быть ровно WEBHOOK_BASE без дополнительных '/webhook'.
-    """
-    if not WEBHOOK_BASE:
-        log.warning("WEBHOOK_BASE is empty -> fallback to polling.")
-        return False
+async def free_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Любой текст, когда не идёт анкета — в GPT
+    user_text = update.message.text.strip()
+    answer = await gpt_reply(user_text)
+    # Уточняющая reply-клавиатура (по желанию)
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("/rent")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await update.message.reply_text(answer, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-    try:
-        # Сначала удалим на всякий случай
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(0.2)
-
-        webhook_url = WEBHOOK_BASE  # путь только '/', без /webhook
-        await app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
-        log.info("Webhook set to: %s", webhook_url)
-        return True
-    except Exception as e:
-        log.error("set_webhook failed: %s", e)
-        return False
-
+# ====== СБОРКА ПРИЛОЖЕНИЯ ==================================================
 def build_application() -> Application:
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("ENV TELEGRAM_TOKEN is required")
-
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    # /start, /cancel
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("cancel", cancel))
+    app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
 
     # Анкета /rent
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("rent", rent_entry)],
+    rent_conv = ConversationHandler(
+        entry_points=[CommandHandler("rent", rent_start)],
         states={
-            ST_TYPE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_get_type)],
-            ST_BUDGET:  [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_get_budget)],
-            ST_AREA:    [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_get_area)],
-            ST_BEDS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_get_beds)],
-            ST_CHECKIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_get_checkin)],
-            ST_CHECKOUT:[MessageHandler(filters.TEXT & ~filters.COMMAND, rent_get_checkout)],
-            ST_NOTES:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_finish)],
+            RENT_TYPE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_type)],
+            RENT_BUDGET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_budget)],
+            RENT_AREA:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_area)],
+            RENT_BEDS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_beds)],
+            RENT_CHECKIN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_checkin)],
+            RENT_CHECKOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_checkout)],
+            RENT_NOTES:    [MessageHandler(filters.TEXT & ~filters.COMMAND, rent_notes)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", rent_cancel)],
         allow_reentry=True,
+        name="rent-conv",
+        persistent=False,
     )
-    application.add_handler(conv)
 
-    # Свободное общение (любой текст, который не перехватили ранее)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
+    app.add_handler(rent_conv)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    return application
+    # Свободное общение — в самом конце, чтобы не мешать /rent
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_chat))
 
-async def run():
-    app = build_application()
-    ok = await setup_webhook(app)
+    return app
 
-    if ok:
-        # Запускаем HTTP-сервер PTB (слушает '/')
-        port = int(os.getenv("PORT", "10000"))
-        log.info("==> Starting webhook server on 0.0.0.0:%s | url=%s", port, WEBHOOK_BASE)
-        await app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            webhook_url=WEBHOOK_BASE,
-        )
-    else:
-        # Фоллбек — polling (на всякий случай)
-        log.warning("Falling back to polling mode.")
-        await app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+# ====== ЗАПУСК WEBHOOK (Render) ============================================
 def main():
-    try:
-        asyncio.run(run())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    app = build_application()
+
+    # URL, по которому Telegram будет слать апдейты:
+    webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+
+    log.info("Starting webhook on 0.0.0.0:%s, url=%s", PORT, webhook_url)
+
+    # ВАЖНО: НЕ использовать asyncio.run(...) вокруг run_webhook,
+    # иначе будет 'Cannot close a running event loop'.
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH.lstrip("/"),
+        webhook_url=webhook_url,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
