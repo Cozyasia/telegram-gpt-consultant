@@ -1,9 +1,14 @@
 python-telegram-bot[webhooks]==21.6
 openai>=1.40.0
+requests>=2.32.3
+
+# Google Sheets (опционально, но не ломает бота, если ENV пустые)
 gspread==6.0.2
 google-auth==2.31.0
+google-auth-oauthlib==1.2.2
 oauthlib==3.2.2
 cachetools==5.4.0
-requests==2.32.3
+
+# Разбор дат, если решишь расширить анкету
 dateparser==1.2.0
-python-dateutil>=2.9.0
+python-dateutil==2.9.0.post0
