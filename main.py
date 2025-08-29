@@ -1,7 +1,7 @@
+# main.py
 import os
 import json
 import logging
-import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -11,14 +11,14 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ── ЛОГИ ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────── ЛОГИ ───────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("cozyasia-bot")
 
-# ── ENV / КОНСТАНТЫ ───────────────────────────────────────────────────────────
+# ──────────────── ENV / КОНСТАНТЫ (ЗАДАЙ В RENDER) ─────────
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
@@ -26,12 +26,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
-MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "5978240436"))
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))
+MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "5978240436"))  # @Cozy_asia
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))               # рабочая группа (opcional)
 
 GOOGLE_SHEETS_DB_ID = os.getenv("GOOGLE_SHEETS_DB_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
+# ─────────── Ссылки Cozy Asia — только наши ресурсы ─────────
 LINK_SITE = "https://cozy.asia"
 LINK_CHANNEL_ALL = "https://t.me/SamuiRental"
 LINK_CHANNEL_VILLAS = "https://t.me/arenda_vill_samui"
@@ -44,14 +45,15 @@ PROMO_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("📷 Instagram", url=LINK_INSTAGRAM)],
 ])
 
-(
-    Q_TYPE, Q_BUDGET, Q_AREA, Q_BEDR, Q_CHECKIN, Q_CHECKOUT, Q_NOTES
-) = range(7)
+# ──────────────────────── Состояния анкеты ──────────────────
+(Q_TYPE, Q_BUDGET, Q_AREA, Q_BEDR, Q_CHECKIN, Q_CHECKOUT, Q_NOTES) = range(7)
 
+# Память на пользователя: стадия/данные/флаг отправки лида
 user_state: Dict[int, Dict[str, Any]] = {}
+# частота CTA
 cta_cache: Dict[int, datetime] = {}
 
-# ── GOOGLE SHEETS (лениво) ────────────────────────────────────────────────────
+# ──────────────── Google Sheets (ленивая инициализация) ─────
 _gs_client = None
 _gs_sheet = None
 
@@ -82,7 +84,10 @@ def gs_append_row(row: list):
     except Exception as e:
         log.warning(f"Append to Sheets failed: {e}")
 
-# ── ДАТЫ (любой формат) ───────────────────────────────────────────────────────
+def lead_link_to_sheet() -> str:
+    return f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_DB_ID}" if GOOGLE_SHEETS_DB_ID else ""
+
+# ─────────────────────── Парсинг любых дат ──────────────────
 def parse_any_date(s: str) -> Optional[str]:
     if not s:
         return None
@@ -93,7 +98,7 @@ def parse_any_date(s: str) -> Optional[str]:
     except Exception:
         return None
 
-# ── РЕАЛ ЕСТЕЙТ МЕТКА (не блокируем чат) ─────────────────────────────────────
+# ──────────────── Детектор «намерений недвижимости» ─────────
 RE_INTENT_KEYS = (
     "недвижим","аренд","снять","съём","дом","вилл","апарт","квартир","лот",
     "договор","продаж","купить","жильё","house","villa","apartment","rent","lease"
@@ -110,7 +115,7 @@ def should_show_cta(uid: int) -> bool:
         return True
     return False
 
-# ── OPENAI: надёжный вызов + ретраи + резервные модели ───────────────────────
+# ───────────────────── OpenAI надёжный вызов ────────────────
 _openai_client = None
 def oai():
     global _openai_client
@@ -121,18 +126,18 @@ def oai():
 
 SYSTEM_PROMPT = (
     "Ты — дружелюбный русскоязычный ассистент Cozy Asia. Отвечай по делу и кратко. "
-    "Можно свободно беседовать о Самуи (погода, сезоны, районы, быт, куда сходить и т.д.). "
-    "Про недвижимость — отвечай кратко и всегда показывай ресурсы Cozy Asia, не упоминай других."
+    "Можно свободно беседовать о Самуи (погода, сезоны, районы, быт, куда сходить). "
+    "Если речь про недвижимость — отвечай кратко и всегда показывай ресурсы Cozy Asia, "
+    "не упоминай другие агентства или источники."
 )
 
-FALLBACK_MODELS = [
-    # порядок важен: сначала ENV, потом альтернативы
-]
-
 async def gpt_call(text: str) -> Optional[str]:
-    """Надёжный вызов: отдельный поток, ретраи, резервные модели."""
+    """Вызов OpenAI с ретраями и переключением моделей. Выполняется в отдельном потоке."""
     if not OPENAI_API_KEY:
         return None
+
+    import asyncio
+
     models = [OPENAI_MODEL] + [
         m for m in ("gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "o4-mini")
         if m != OPENAI_MODEL
@@ -140,7 +145,7 @@ async def gpt_call(text: str) -> Optional[str]:
 
     last_err = None
     for model in models:
-        for attempt in range(2):  # 2 попытки на модель
+        for attempt in range(2):
             try:
                 def _do():
                     resp = oai().chat.completions.create(
@@ -150,7 +155,7 @@ async def gpt_call(text: str) -> Optional[str]:
                             {"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": text}
                         ],
-                        timeout=40,  # защита от зависаний
+                        timeout=40,
                     )
                     return (resp.choices[0].message.content or "").strip()
                 return await asyncio.to_thread(_do)
@@ -158,14 +163,10 @@ async def gpt_call(text: str) -> Optional[str]:
                 last_err = f"{type(e).__name__}: {e}"
                 log.warning(f"OpenAI fail (model={model}, try={attempt+1}): {e}")
                 await asyncio.sleep(0.7)
-        # переходим к следующей модели
     log.error(f"OpenAI total failure: {last_err}")
     return None
 
-# ── ВСПОМОГАТЕЛЬНЫЕ ──────────────────────────────────────────────────────────
-def lead_link_to_sheet() -> str:
-    return f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_DB_ID}" if GOOGLE_SHEETS_DB_ID else ""
-
+# ─────────────────────── Утилиты форматирования ─────────────
 def fmt_user(u) -> str:
     uname = f"@{u.username}" if getattr(u, "username", None) else (u.full_name or str(u.id))
     return f"{uname} (ID: {u.id})"
@@ -181,14 +182,14 @@ def promo_text() -> str:
         f"• Instagram: {LINK_INSTAGRAM}"
     )
 
-# ── Команды ──────────────────────────────────────────────────────────────────
+# ────────────────────────── Команды ─────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_state.pop(update.effective_user.id, None)  # сброс анкеты
     await update.message.reply_text(
-        "✅ Я здесь! Можете спросить о Самуи — подскажу.\n\n"
+        "✅ Я здесь! Можно спросить о Самуи — подскажу.\n\n"
         "👉 Для подбора жилья нажмите /rent — отвечу на 7 вопросов, сформирую заявку и передам менеджеру.",
         reply_markup=PROMO_KB
     )
-    user_state.pop(update.effective_user.id, None)
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state.pop(update.effective_user.id, None)
@@ -204,12 +205,12 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"GROUP_CHAT_ID: {GROUP_CHAT_ID}",
         f"SHEETS: {'ON' if GOOGLE_SHEETS_DB_ID else 'OFF'}",
         f"Webhook URL: {wh.url or '-'}",
-        f"Webhook last_error: {getattr(wh, 'last_error_message', None) or '-'}",
         f"Pending updates: {wh.pending_update_count}",
+        f"Last error: {getattr(wh, 'last_error_message', None) or '-'}",
     ]
     await update.message.reply_text("\n".join(lines))
 
-# ── Анкета /rent ─────────────────────────────────────────────────────────────
+# ───────────────────────── Анкета /rent ─────────────────────
 async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user_state[uid] = {"stage": Q_TYPE, "lead_sent": False, "data": {}}
@@ -270,8 +271,8 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await finalize_lead(update, context, st["data"])
     user_state[uid] = {"stage": None, "lead_sent": True, "data": st["data"]}
     await update.message.reply_text(
-        "Готово! Заявка сформирована и передана менеджеру. Скоро свяжемся. "
-        "А пока задавайте любые вопросы 🙂",
+        "Готово! Заявка сформирована и передана менеджеру. "
+        "Скоро свяжемся. А пока задавайте любые вопросы 🙂",
         reply_markup=PROMO_KB
     )
     return ConversationHandler.END
@@ -291,7 +292,7 @@ async def finalize_lead(update: Update, context: ContextTypes.DEFAULT_TYPE, data
         f"Условия/прим.: {data.get('notes','')}\n"
         f"Создано: {created}\n"
     )
-    # Группа и менеджер
+    # Уведомления
     try:
         if GROUP_CHAT_ID:
             await context.bot.send_message(GROUP_CHAT_ID, lead_text)
@@ -303,7 +304,7 @@ async def finalize_lead(update: Update, context: ContextTypes.DEFAULT_TYPE, data
     except Exception as e:
         log.warning(f"Send to manager failed: {e}")
 
-    # Sheets
+    # Sheets (если подключено)
     if GOOGLE_SHEETS_DB_ID:
         row = [
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -317,42 +318,44 @@ async def finalize_lead(update: Update, context: ContextTypes.DEFAULT_TYPE, data
         if sheet_url:
             await update.message.reply_text(f"🔗 Заявка зафиксирована: {sheet_url}")
 
-# ── Свободный чат (дефолт) ────────────────────────────────────────────────────
+# ─────────────────────── Свободный GPT-чат ─────────────────
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = update.message.text or ""
 
     st = user_state.get(uid)
     if st and st.get("stage") is not None:
-        await update.message.reply_text("Сейчас заполняем анкету. Напишите /cancel, чтобы выйти, или ответьте на вопрос 🙂")
+        await update.message.reply_text("Сейчас заполняем анкету. Ответьте на вопрос или /cancel для выхода 🙂")
         return
 
     # GPT приоритетно
     reply = await gpt_call(txt)
 
     if not reply:
-        # Мягкий фолбэк — минимум полезной информации и всё.
+        # Мягкий фолбэк (без чужих ссылок)
         reply = ("Коротко про Самуи: янв–март суше и спокойнее; апрель — жаркий штиль; "
                  "окт–дек больше дождей и волна на востоке. Можете уточнить — подскажу.")
 
-    # Добавляем CTA только если в тексте есть явная недвижимость и не чаще 1/3ч
+    # CTA добавляем только по «намерению недвижимости» и не чаще, чем раз в 3 часа
     if is_real_estate_intent(txt) and should_show_cta(uid):
         reply += "\n\n" + promo_text()
         await update.message.reply_text(reply, reply_markup=PROMO_KB)
     else:
         await update.message.reply_text(reply)
 
-# ── Сборка/запуск ─────────────────────────────────────────────────────────────
+# ─────────────────── Сборка и запуск (Render) ───────────────
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("ENV TELEGRAM_BOT_TOKEN is required")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("diag", cmd_diag))
 
+    # Анкета /rent
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", cmd_rent)],
         states={
@@ -369,7 +372,7 @@ def build_application() -> Application:
     )
     app.add_handler(conv)
 
-    # Свободный чат — последним
+    # Свободный чат — в самом конце
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
 
     return app
@@ -377,17 +380,26 @@ def build_application() -> Application:
 def main():
     app = build_application()
 
-    async def runner():
-        await app.bot.delete_webhook(drop_pending_updates=False)
-        url = f"{WEBHOOK_BASE}/webhook/{BOT_TOKEN}"
-        log.info(f"Starting webhook on 0.0.0.0:{PORT} | url={url}")
-        await app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=f"webhook/{BOT_TOKEN}",
-            webhook_url=url,
-        )
-    asyncio.run(runner())
+    # удалим старый вебхук перед стартом (без конфликтов с loop)
+    async def pre_start():
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            log.warning(f"delete_webhook fail: {e}")
+
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(pre_start())
+
+    url = f"{WEBHOOK_BASE}/webhook/{BOT_TOKEN}"
+    log.info(f"Starting webhook on 0.0.0.0:{PORT} | url={url}")
+
+    # ВАЖНО: не используем asyncio.run — даём PTB управлять loop
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=f"webhook/{BOT_TOKEN}",
+        webhook_url=url,
+    )
 
 if __name__ == "__main__":
     main()
