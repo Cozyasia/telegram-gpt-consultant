@@ -1,7 +1,7 @@
-# main.py — Cozy Asia Bot (ptb v20+)
-# Полная версия: анкета /rent -> Sheets, редиректор на свои ресурсы,
-# показ контакта менеджера только ПОСЛЕ анкеты, дублирование заявок в личку и в группу,
-# preflight для polling-слота, команды /id и /groupid.
+# main.py — Cozy Asia Bot (ptb v20+, WEBHOOK for Render Web Service)
+# Анкета /rent -> Google Sheets, редиректор на свои ресурсы,
+# контакт менеджера только ПОСЛЕ анкеты, дублирование заявок в личку и (опц.) группу,
+# webhook с биндингом на $PORT (Render), health-check "/".
 
 import os
 import json
@@ -33,10 +33,10 @@ INSTAGRAM_URL     = "https://www.instagram.com/cozy.asia?igsh=cmt1MHA0ZmM3OTRu"
 MANAGER_TG_URL  = "https://t.me/cozy_asia"   # @Cozy_asia
 MANAGER_CHAT_ID = 5978240436                 # Cozy Asia manager
 
-# Рабочая группа (подставь свой -100… когда узнаешь):
-GROUP_CHAT_ID = None
+# Рабочая группа (подставь свой -100… когда узнаешь, можно оставить None)
+GROUP_CHAT_ID = None  # например: -1001234567890123
 
-# ── ПРИВЕТСТВИЕ (исправленное) ──────────────────────────────────────────────
+# ── ПРИВЕТСТВИЕ ──────────────────────────────────────────────────────────────
 START_TEXT = (
     "✅ Я уже тут!\n"
     "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
@@ -71,7 +71,7 @@ def build_cta_with_manager() -> tuple[str, InlineKeyboardMarkup]:
         msg += "\n\n👤 Контакт менеджера открыт ниже."
     return msg, kb
 
-# ── БЛОКИРАТОР УПОМИНАНИЙ КОНКУРЕНТОВ ───────────────────────────────────────
+# ── БЛОКИРОВАТЕЛЬ «советов конкурентов» ─────────────────────────────────────
 BLOCK_PATTERNS = (
     "местных агентств","других агентств","на facebook","в группах facebook",
     "агрегаторах","marketplace","airbnb","booking","renthub","fazwaz",
@@ -86,7 +86,7 @@ def sanitize_competitors(text: str) -> str:
         return "Чтобы не тратить время на сторонние площадки, лучше сразу к нам.\n\n" + msg
     return text
 
-# ── РЕАЛТИ-ТРИГГЕРЫ (ловим свободные вопросы) ───────────────────────────────
+# ── РЕАЛТИ-ТРИГГЕРЫ ──────────────────────────────────────────────────────────
 REALTY_KEYWORDS = {
     "аренда","сдать","сниму","снять","дом","вилла","квартира","комнаты","спальни",
     "покупка","купить","продажа","продать","недвижимость","кондо","condo","таунхаус",
@@ -132,7 +132,7 @@ async def rent_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     form = context.user_data["form"]
 
     ok, row_url = await write_lead_to_sheets(update, context, form)
-    context.user_data["rental_form_completed"] = True  # допускаем контакт менеджера
+    context.user_data["rental_form_completed"] = True
     await notify_staff(update, context, form, row_url=row_url)
 
     msg, kb = build_cta_with_manager()
@@ -146,10 +146,10 @@ async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 # ENV:
-# TELEGRAM_BOT_TOKEN
-# GOOGLE_SERVICE_ACCOUNT_JSON  (полный JSON ключа)
-# GOOGLE_SHEETS_DB_ID
-# GOOGLE_SHEETS_SHEET_NAME (опц., по умолчанию 'Leads')
+#   TELEGRAM_BOT_TOKEN
+#   GOOGLE_SERVICE_ACCOUNT_JSON  (полный JSON ключа)
+#   GOOGLE_SHEETS_DB_ID
+#   GOOGLE_SHEETS_SHEET_NAME (опц., 'Leads' по умолчанию)
 async def write_lead_to_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE, form: dict):
     sheet_id = os.getenv("GOOGLE_SHEETS_DB_ID")
     if not sheet_id:
@@ -177,7 +177,6 @@ async def write_lead_to_sheets(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             ws = sh.add_worksheet(title=ws_name, rows=1000, cols=20)
 
-        # заголовки
         if not ws.get_all_values():
             ws.append_row(
                 ["created_at","user_id","username","first_name","type","area","budget","bedrooms","notes","source"],
@@ -198,7 +197,6 @@ async def write_lead_to_sheets(update: Update, context: ContextTypes.DEFAULT_TYP
         ]
         ws.append_row(row, value_input_option="USER_ENTERED")
 
-        # ссылка на лист (для удобства)
         row_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={ws.id}"
         return True, row_url
     except Exception as e:
@@ -221,18 +219,19 @@ async def notify_staff(update: Update, context: ContextTypes.DEFAULT_TYPE, form:
     if row_url:
         text += f"\n🗂 Таблица: {row_url}"
 
-    targets = [cid for cid in (MANAGER_CHAT_ID, GROUP_CHAT_ID) if cid]
-    for chat_id in targets:
+    for chat_id in [MANAGER_CHAT_ID, GROUP_CHAT_ID]:
+        if not chat_id:
+            continue
         try:
             await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
         except Exception as e:
             log.warning("Notify failed for %s: %s", chat_id, e)
 
-# ── GPT-фолбэк (заглушка с политикой) ───────────────────────────────────────
+# ── GPT-фолбэк (заглушка) ───────────────────────────────────────────────────
 async def call_gpt(user_text: str) -> str:
     return "Готов помочь. По вопросам недвижимости лучше сразу у нас — жмите /rent или смотрите ссылки ниже."
 
-# ── СВОБОДНЫЙ ЧАТ (перехватывает realty-вопросы) ────────────────────────────
+# ── СВОБОДНЫЙ ЧАТ ───────────────────────────────────────────────────────────
 async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text or ""
     completed = bool(context.user_data.get("rental_form_completed", False))
@@ -255,30 +254,34 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_groupid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Group chat ID: {update.effective_chat.id}")
 
-# ── PREFLIGHT: жёстко освобождаем polling-слот ──────────────────────────────
-def preflight_release_slot(token: str, attempts: int = 6):
+# ── PREFLIGHT (опционально для миграций) ────────────────────────────────────
+def preflight_release_slot(token: str, attempts: int = 3):
     base = f"https://api.telegram.org/bot{token}"
     try:
         requests.post(f"{base}/deleteWebhook", params={"drop_pending_updates": True}, timeout=10)
-        log.info("deleteWebhook -> OK")
+        logging.info("deleteWebhook -> OK")
     except Exception as e:
-        log.warning("deleteWebhook error: %s", e)
-    backoff = 2
-    for i in range(1, attempts + 1):
-        try:
-            r = requests.post(f"{base}/close", timeout=10)
-            if r.ok and r.json().get("ok"):
-                log.info("close -> OK (attempt %s)", i)
-                break
-        except Exception as e:
-            log.warning("close error: %s", e)
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 20)
+        logging.warning("deleteWebhook error: %s", e)
+    # Для webhook это не обязательно, но не мешает.
 
-# ── MAIN ────────────────────────────────────────────────────────────────────
+# ── MAIN (WEBHOOK) ──────────────────────────────────────────────────────────
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    preflight_release_slot(token)
+
+    # БАЗОВЫЙ ПУБЛИЧНЫЙ URL сервиса (в Render возьми из Dashboard)
+    # Пример: https://telegram-gpt-consultant-d4yn.onrender.com
+    base_url = os.getenv("WEBHOOK_BASE")
+    if not base_url:
+        # Fallback для Render: некоторые планы прокидывают RENDER_EXTERNAL_URL
+        base_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not base_url:
+        raise RuntimeError("WEBHOOK_BASE (или RENDER_EXTERNAL_URL) не задан. Укажи публичный https URL сервиса.")
+
+    # Health-check для Render
+    # (PTB заведёт aiohttp-сервер сам, корень '/' отдаст 200 OK)
+    # Если хочешь явный answer '/', можно подключить aiohttp вручную — но PTB достаточно.
+
+    preflight_release_slot(token)  # сброс старого вебхука/очереди
 
     app = ApplicationBuilder().token(token).build()
 
@@ -301,11 +304,28 @@ def main():
     )
     app.add_handler(conv)
 
-    # Свободный чат (ставим ДО других текст-хэндлеров)
+    # Свободный чат
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_handler))
 
-    log.info("Bot is running…")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # Параметры webhook для Render Web Service
+    port = int(os.getenv("PORT", "10000"))  # Render выставляет $PORT
+    url_path = token  # пусть путь будет секретным токеном
+    webhook_url = f"{base_url.rstrip('/')}/webhook/{url_path}"
+
+    logging.info(f"Starting webhook on 0.0.0.0:{port}, url={webhook_url}")
+
+    # Запускаем webhook-сервер (PTB сам поднимет aiohttp + health)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=url_path,
+        webhook_url=webhook_url,
+        # можно указать secret_token для проверки X-Telegram-Bot-Api-Secret-Token
+        # secret_token=os.getenv("WEBHOOK_SECRET", None),
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        webhook_path=f"/webhook/{url_path}",
+    )
 
 if __name__ == "__main__":
     main()
