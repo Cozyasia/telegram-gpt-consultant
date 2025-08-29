@@ -7,12 +7,13 @@
 #   • deep search по вашим каналам (t.me/s/<channel>?q=…)
 #   • запись в Google Sheets (если настроено) + ссылка на таблицу
 #   • уведомления менеджеру (ЛС) и в рабочую группу
-#   • анти-дубликаты: повторные сообщения после 7/7 НЕ создают новую заявку;
+#   • анти-дубликаты: после 7/7 новые заявки не создаются автоматически;
 #     новую можно создать только командой /rent
-# - свободный GPT-чат через OpenAI: отвечает на жизнь/погоду/районы и т.п.;
-#   про недвижимость — мягко ведёт к /rent и вашим ссылкам; не рекламирует других
-# - служебные: /id /groupid /diag
-# - webhook Render: 0.0.0.0:$PORT, URL = WEBHOOK_BASE/webhook/<BOT_TOKEN>
+# - Свободный GPT-чат через OpenAI: отвечает на любые темы; если разговор уходит
+#   в недвижимость — НЕ прерывает ответ, а ДОБАВЛЯЕТ ваш CTA (сайт/каналы/IG, /rent)
+#   и фразу про уведомление менеджера. Рекламу третьих лиц не даём.
+# - /id /groupid /diag
+# - Webhook Render: 0.0.0.0:$PORT, URL = WEBHOOK_BASE/webhook/<BOT_TOKEN>
 
 from __future__ import annotations
 import os, json, logging, time, urllib.parse
@@ -95,6 +96,9 @@ def mentions_realty(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in REALTY_KEYWORDS)
 
+def looks_like_realty_question(text: str) -> bool:
+    return mentions_realty(text or "")
+
 def sanitize_competitors(text: str) -> str:
     if not text:
         return text
@@ -133,8 +137,8 @@ def build_cta_public() -> Tuple[str, InlineKeyboardMarkup]:
         f"• Канал с лотами: {TG_CHANNEL_MAIN}\n"
         f"• Канал по виллам: {TG_CHANNEL_VILLAS}\n"
         f"• Instagram: {INSTAGRAM_URL}\n\n"
-        "✍️ Связаться с менеджером можно после короткой заявки в /rent — "
-        "это нужно, чтобы зафиксировать запрос и выдать точные варианты."
+        "✍️ Самый действенный способ — пройти короткую анкету /rent.\n"
+        "Я сделаю подборку лотов по вашим критериям и передам менеджеру."
     )
     return msg, InlineKeyboardMarkup(kb)
 
@@ -144,7 +148,7 @@ def build_cta_with_manager() -> Tuple[str, InlineKeyboardMarkup]:
     msg += "\n\n👤 Контакт менеджера открыт ниже."
     return msg, kb
 
-# ────────────────────────── Подборки по вашим каналам (deep search)
+# ────────────────────────── Подборки по каналам (deep search)
 def build_channel_search_links(area: str, bedrooms: str, budget: str) -> List[Tuple[str, str]]:
     q = " ".join(x for x in [area, f"{bedrooms} спальн" if bedrooms else "", budget] if x).strip()
     qenc = urllib.parse.quote(q) if q else ""
@@ -420,20 +424,32 @@ async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Окей, если передумаете — пишите /rent.")
     return ConversationHandler.END
 
-# ────────────────────────── Свободный чат
+# ────────────────────────── Свободный чат (GPT + умный CTA)
 async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.effective_message.text or ""
+    user_text = update.effective_message.text or ""
     completed = bool(context.user_data.get("rental_form_completed", False))
 
-    # Если про недвижимость — ведём в вашу воронку (без рекламы других)
-    if mentions_realty(text):
-        msg, kb = (build_cta_with_manager() if completed else build_cta_public())
-        await update.effective_message.reply_text(msg, reply_markup=kb, disable_web_page_preview=True)
+    # 1) Сначала — даём умный ответ GPT на ЛЮБОЙ текст
+    gpt_reply = (await call_gpt(user_text)).strip()
+
+    # 2) Определяем: разговор уходит в сторону недвижимости?
+    need_cta = looks_like_realty_question(user_text) or looks_like_realty_question(gpt_reply)
+
+    if need_cta:
+        cta_msg, cta_kb = (build_cta_with_manager() if completed else build_cta_public())
+        tail = (
+            "\n\n🔧 Самый действенный способ — пройти короткую анкету командой /rent.\n"
+            "Я сделаю подборку лотов (дома/апартаменты/виллы) по вашим критериям и сразу отправлю вам.\n"
+            f"{'Менеджер уже в курсе и свяжется с вами в ближайшее время.' if completed else 'Менеджер получит вашу заявку и свяжется для уточнений.'}"
+        )
+        combined = (gpt_reply + tail + "\n\n" + cta_msg).strip()
+        await update.effective_message.reply_text(
+            combined, reply_markup=cta_kb, disable_web_page_preview=True
+        )
         return
 
-    # Иначе — обычный GPT-ответ
-    reply = await call_gpt(text)
-    await update.effective_message.reply_text(reply, disable_web_page_preview=True)
+    # 3) Если не про недвижимость — отдаём чистый GPT-ответ
+    await update.effective_message.reply_text(gpt_reply, disable_web_page_preview=True)
 
 # ────────────────────────── Служебные команды
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -517,8 +533,8 @@ def main():
 
     app = build_application()
 
-    port = int(os.getenv("PORT", str(DEFAULT_PORT)))  # Render передаёт $PORT
-    url_path = token                                   # секретный путь = токен
+    port = int(os.getenv("PORT", "10000"))
+    url_path = token
     webhook_url = f"{base_url.rstrip('/')}/webhook/{url_path}"
 
     log.info("Starting webhook on 0.0.0.0:%s | url=%s", port, webhook_url)
@@ -528,7 +544,6 @@ def main():
         url_path=f"webhook/{url_path}",
         webhook_url=webhook_url,
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
