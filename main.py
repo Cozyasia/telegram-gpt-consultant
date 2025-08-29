@@ -1,23 +1,27 @@
-# main.py — Cozy Asia Bot (ptb v20+, webhook/Render)
-# -----------------------------------------------------------------------------
-# Функционал:
-# - /start (новое приветствие)
+# main.py — Cozy Asia Bot (ptb v21.6, webhook/Render)
+# ─────────────────────────────────────────────────────────────────────────────
+# Что внутри:
+# - /start новое приветствие
 # - /rent анкета: type → budget → area → bedrooms → checkin → checkout → notes
-#   -> запись в Google Sheets (если настроено)
-#   -> автоподбор ссылок на ваши каналы по запросу (deep search)
-#   -> уведомления менеджеру и в рабочую группу (+ссылка на шит, +ссылки-подборки)
-# - Свободный чат через OpenAI: общение на любые темы, но про недвижимость
-#   — мягко ведём к /rent и вашим ресурсам; без рекламы других агентств
-# - Служебные: /id /groupid /diag
-# - Webhook для Render: 0.0.0.0:$PORT, URL = WEBHOOK_BASE/webhook/<BOT_TOKEN>
+#   • даты в ЛЮБОМ формате (01.10.2025, 2025-10-01, 1/10/25, “1 окт 2025”, 2026.01.01…)
+#   • deep search по вашим каналам (t.me/s/<channel>?q=…)
+#   • запись в Google Sheets (если настроено) + ссылка на таблицу
+#   • уведомления менеджеру (ЛС) и в рабочую группу
+#   • анти-дубликаты: повторные сообщения после 7/7 НЕ создают новую заявку;
+#     новую можно создать только командой /rent
+# - свободный GPT-чат через OpenAI: отвечает на жизнь/погоду/районы и т.п.;
+#   про недвижимость — мягко ведёт к /rent и вашим ссылкам; не рекламирует других
+# - служебные: /id /groupid /diag
+# - webhook Render: 0.0.0.0:$PORT, URL = WEBHOOK_BASE/webhook/<BOT_TOKEN>
 
 from __future__ import annotations
 import os, json, logging, time, urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import requests
+from dateutil import parser as dtparser
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes,
@@ -35,13 +39,15 @@ WEBSITE_URL       = "https://www.cozy-asiath.com/"
 TG_CHANNEL_MAIN   = "https://t.me/SamuiRental"
 TG_CHANNEL_VILLAS = "https://t.me/arenda_vill_samui"
 INSTAGRAM_URL     = "https://www.instagram.com/cozy.asia?igsh=cmt1MHA0ZmM3OTRu"
-MAIN_CH_USERNAME  = "SamuiRental"
-VILLAS_CH_USERNAME= "arenda_vill_samui"
+MAIN_CH_USERNAME   = "SamuiRental"
+VILLAS_CH_USERNAME = "arenda_vill_samui"
 
-MANAGER_TG_URL  = "https://t.me/cozy_asia"   # показываем ТОЛЬКО после анкеты
+# Менеджер (контакт показываем ТОЛЬКО ПОСЛЕ анкеты)
+MANAGER_TG_URL  = "https://t.me/cozy_asia"   # @Cozy_asia
 MANAGER_CHAT_ID = 5978240436                 # личка менеджера
 
-GROUP_CHAT_ID: Optional[int] = None          # рабочая группа
+# Рабочая группа (можно через ENV GROUP_CHAT_ID)
+GROUP_CHAT_ID: Optional[int] = None
 _env_group = os.getenv("GROUP_CHAT_ID")
 if _env_group:
     try:
@@ -49,7 +55,7 @@ if _env_group:
     except Exception:
         log.warning("GROUP_CHAT_ID из ENV не int: %r", _env_group)
 
-# ────────────────────────── ТЕКСТЫ
+# ────────────────────────── ТЕКСТЫ/КЕЙВОРДЫ
 START_TEXT = (
     "✅ Я уже тут!\n"
     "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
@@ -73,7 +79,9 @@ BLOCK_PATTERNS = (
 
 TYPE, BUDGET, AREA, BEDROOMS, CHECKIN, CHECKOUT, NOTES = range(7)
 DEFAULT_PORT = 10000
+DUPLICATE_COOLDOWN_SEC = 15 * 60  # 15 минут
 
+# ────────────────────────── УТИЛИТЫ
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -96,8 +104,23 @@ def sanitize_competitors(text: str) -> str:
         return "Чтобы не тратить время на сторонние площадки, лучше сразу к нам.\n\n" + msg
     return text
 
-# ────────────────────────── CTA
-def build_cta_public() -> tuple[str, InlineKeyboardMarkup]:
+def parse_to_iso_date(text: str) -> str:
+    """Любые привычные форматы → YYYY-MM-DD; если не вышло — возвращаем как есть."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    try:
+        dt = dtparser.parse(s, dayfirst=True, yearfirst=False, fuzzy=True)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        try:
+            dt = dtparser.parse(s, dayfirst=False, yearfirst=True, fuzzy=True)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return s
+
+# ────────────────────────── CTA/КНОПКИ
+def build_cta_public() -> Tuple[str, InlineKeyboardMarkup]:
     kb = [
         [InlineKeyboardButton("🌐 Открыть сайт", url=WEBSITE_URL)],
         [InlineKeyboardButton("📣 Телеграм-канал (все лоты)", url=TG_CHANNEL_MAIN)],
@@ -115,28 +138,28 @@ def build_cta_public() -> tuple[str, InlineKeyboardMarkup]:
     )
     return msg, InlineKeyboardMarkup(kb)
 
-def build_cta_with_manager() -> tuple[str, InlineKeyboardMarkup]:
+def build_cta_with_manager() -> Tuple[str, InlineKeyboardMarkup]:
     msg, kb = build_cta_public()
     kb.inline_keyboard.append([InlineKeyboardButton("👤 Написать менеджеру", url=MANAGER_TG_URL)])
     msg += "\n\n👤 Контакт менеджера открыт ниже."
     return msg, kb
 
-# ────────────────────────── Дип-поиск по каналам (без чтения сообщений)
-def build_channel_search_links(area: str, bedrooms: str, budget: str) -> list[tuple[str, str]]:
+# ────────────────────────── Подборки по вашим каналам (deep search)
+def build_channel_search_links(area: str, bedrooms: str, budget: str) -> List[Tuple[str, str]]:
     q = " ".join(x for x in [area, f"{bedrooms} спальн" if bedrooms else "", budget] if x).strip()
     qenc = urllib.parse.quote(q) if q else ""
-    links = []
+    pairs: List[Tuple[str, str]] = []
     if MAIN_CH_USERNAME:
-        links.append((f"Подборка в {MAIN_CH_USERNAME}", f"https://t.me/s/{MAIN_CH_USERNAME}?q={qenc}"))
+        pairs.append((f"Подборка в {MAIN_CH_USERNAME}", f"https://t.me/s/{MAIN_CH_USERNAME}?q={qenc}"))
     if VILLAS_CH_USERNAME:
-        links.append((f"Подборка в {VILLAS_CH_USERNAME}", f"https://t.me/s/{VILLAS_CH_USERNAME}?q={qenc}"))
-    return links
+        pairs.append((f"Подборка в {VILLAS_CH_USERNAME}", f"https://t.me/s/{VILLAS_CH_USERNAME}?q={qenc}"))
+    return pairs
 
-def format_links_md(pairs: list[tuple[str,str]]) -> str:
+def format_links_md(pairs: List[Tuple[str,str]]) -> str:
     if not pairs: return "—"
     return "\n".join([f"• {title}: {url}" for title, url in pairs])
 
-# ────────────────────────── Модель заявки
+# ────────────────────────── МОДЕЛЬ ЗАЯВКИ
 @dataclass
 class Lead:
     created_at: str
@@ -230,9 +253,9 @@ class SheetsClient:
             log.exception("Sheets append failed: %s", e)
             return False, None
 
-# ────────────────────────── Уведомления
+# ────────────────────────── Уведомления менеджеру/в группу
 async def notify_staff(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                       lead: Lead, row_url: Optional[str], proposed_pairs: list[tuple[str,str]]):
+                       lead: Lead, row_url: Optional[str], proposed_pairs: List[Tuple[str,str]]):
     links_text = format_links_md(proposed_pairs)
     text = (
         "🆕 Новая заявка Cozy Asia\n\n"
@@ -284,7 +307,7 @@ async def call_gpt(user_text: str) -> str:
     try:
         client = _get_openai()
         resp = client.responses.create(
-            model="gpt-4o-mini",
+            model="gpt-4o-mini",  # можно заменить на gpt-4o
             input=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_text.strip()},
@@ -301,12 +324,17 @@ async def call_gpt(user_text: str) -> str:
     return "Могу ответить на любые вопросы. По недвижимости — жмите /rent или смотрите ссылки ниже."
 
 # ────────────────────────── АНКЕТА /rent
-def _valid_date(s: str) -> bool:
-    try:
-        datetime.strptime(s.strip(), "%Y-%m-%d")
-        return True
-    except Exception:
-        return False
+def _lead_signature(form: dict) -> tuple:
+    """Нормализуем анкету в кортеж для сравнения (антидубликаты)."""
+    return (
+        (form.get("type") or "").strip().lower(),
+        (form.get("area") or "").strip().lower(),
+        (form.get("budget") or "").strip(),
+        (form.get("bedrooms") or "").strip(),
+        (form.get("checkin") or "").strip(),
+        (form.get("checkout") or "").strip(),
+        (form.get("notes") or "").strip().lower(),
+    )
 
 async def rent_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["form"] = {}
@@ -330,24 +358,18 @@ async def rent_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rent_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["form"]["bedrooms"] = (update.message.text or "").strip()
-    await update.message.reply_text("5/7. Дата **заезда** (YYYY-MM-DD)?")
+    await update.message.reply_text("5/7. Дата заезда?")
     return CHECKIN
 
 async def rent_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = (update.message.text or "").strip()
-    if not _valid_date(val):
-        await update.message.reply_text("Укажи дату в формате YYYY-MM-DD (например, 2025-11-05).")
-        return CHECKIN
-    context.user_data["form"]["checkin"] = val
-    await update.message.reply_text("6/7. Дата **выезда** (YYYY-MM-DD)?")
+    val_raw = (update.message.text or "").strip()
+    context.user_data["form"]["checkin"] = parse_to_iso_date(val_raw)
+    await update.message.reply_text("6/7. Дата выезда?")
     return CHECKOUT
 
 async def rent_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = (update.message.text or "").strip()
-    if not _valid_date(val):
-        await update.message.reply_text("Укажи дату в формате YYYY-MM-DD (например, 2025-12-03).")
-        return CHECKOUT
-    context.user_data["form"]["checkout"] = val
+    val_raw = (update.message.text or "").strip()
+    context.user_data["form"]["checkout"] = parse_to_iso_date(val_raw)
     await update.message.reply_text("7/7. Важные условия? (близость к пляжу, с питомцами, парковка и т.п.)")
     return NOTES
 
@@ -356,31 +378,40 @@ async def rent_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     form = context.user_data["form"]
     lead = Lead.from_context(update, form)
 
-    # Подборки по вашим каналам (deep search)
+    # Подборки по каналам
     proposed_pairs = build_channel_search_links(form.get("area",""), form.get("bedrooms",""), form.get("budget",""))
     proposed_text_for_sheet = format_links_md(proposed_pairs)
+    proposed_count = len(proposed_pairs)
 
-    # Запись в Sheets (если настроено)
-    sheets: SheetsClient = context.application.bot_data.get("sheets")
+    # Анти-дубликаты (сигнатура формы, защита 15 минут)
+    sig = _lead_signature(form)
+    last_leads = context.application.bot_data.get("last_leads", {})
+    now_ts = int(time.time())
+    entry = last_leads.get(update.effective_user.id)
+    is_duplicate = bool(entry and entry[0] == sig and (now_ts - entry[1]) < DUPLICATE_COOLDOWN_SEC)
+
     row_url = None
-    if isinstance(sheets, SheetsClient):
-        ok, row_url = sheets.append_lead(lead, proposed_text_for_sheet)
-        if not ok:
-            log.error("Не удалось записать в Google Sheets")
+    if not is_duplicate:
+        sheets: SheetsClient = context.application.bot_data.get("sheets")
+        if isinstance(sheets, SheetsClient):
+            ok, row_url = sheets.append_lead(lead, proposed_text_for_sheet)
+            if not ok:
+                log.error("Не удалось записать в Google Sheets")
+        await notify_staff(update, context, lead, row_url=row_url, proposed_pairs=proposed_pairs)
+        last_leads[update.effective_user.id] = (sig, now_ts)
+        context.application.bot_data["last_leads"] = last_leads
 
-    # Отметка — форму прошёл (открываем менеджера в CTA)
+    # Флаг — форму прошёл (после этого новые заявки не создаются автоматически)
     context.user_data["rental_form_completed"] = True
 
-    # Уведомления менеджеру и в группу (с ссылками и шитом)
-    await notify_staff(update, context, lead, row_url=row_url, proposed_pairs=proposed_pairs)
-
-    # Пользователю — ссылки + менеджер
+    # Ответ пользователю
     human_links = "\n".join([f"• {t}: {u}" for t,u in proposed_pairs]) or "—"
     msg_user, kb = build_cta_with_manager()
     msg_user = (
-        "Заявка сохранена ✅\n\n"
-        "🔎 Я уже посмотрел, что есть на наших каналах. Вот подборки по вашему запросу:\n"
-        f"{human_links}\n\n" + msg_user
+        "Заявка сформирована ✅ и уже передана менеджеру.\n"
+        f"🔎 По вашим параметрам нашёл подборки ({proposed_count}):\n"
+        f"{human_links}\n\n" + msg_user +
+        "\n\n✉️ Если понадобится уточнить детали — просто напишите мне, отвечу как обычный чат."
     )
     await update.message.reply_text(msg_user, reply_markup=kb, disable_web_page_preview=True)
     return ConversationHandler.END
@@ -394,13 +425,13 @@ async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text or ""
     completed = bool(context.user_data.get("rental_form_completed", False))
 
-    # Только если явно «недвижимость» — ведём в нашу воронку
+    # Если про недвижимость — ведём в вашу воронку (без рекламы других)
     if mentions_realty(text):
         msg, kb = (build_cta_with_manager() if completed else build_cta_public())
         await update.effective_message.reply_text(msg, reply_markup=kb, disable_web_page_preview=True)
         return
 
-    # Любые НЕДЕВЕЖИМОСТНЫЕ вопросы — нормальный GPT-ответ
+    # Иначе — обычный GPT-ответ
     reply = await call_gpt(text)
     await update.effective_message.reply_text(reply, disable_web_page_preview=True)
 
@@ -442,18 +473,22 @@ def preflight_release_webhook(token: str):
 def build_application() -> Application:
     token = env_required("TELEGRAM_BOT_TOKEN")
 
+    # Sheets (опционально)
     sheet_id = os.getenv("GOOGLE_SHEETS_DB_ID")
     sheet_name = os.getenv("GOOGLE_SHEETS_SHEET_NAME", "Leads")
     sheets = SheetsClient(sheet_id=sheet_id, sheet_name=sheet_name)
 
     app = ApplicationBuilder().token(token).build()
     app.bot_data["sheets"] = sheets
+    app.bot_data["last_leads"] = {}  # user_id -> (signature, ts)
 
+    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("groupid", cmd_groupid))
     app.add_handler(CommandHandler("diag", cmd_diag))
 
+    # Анкета
     conv = ConversationHandler(
         entry_points=[CommandHandler("rent", rent_start)],
         states={
@@ -469,6 +504,7 @@ def build_application() -> Application:
     )
     app.add_handler(conv)
 
+    # Свободный чат
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_handler))
     return app
 
@@ -481,8 +517,8 @@ def main():
 
     app = build_application()
 
-    port = int(os.getenv("PORT", str(DEFAULT_PORT)))
-    url_path = token
+    port = int(os.getenv("PORT", str(DEFAULT_PORT)))  # Render передаёт $PORT
+    url_path = token                                   # секретный путь = токен
     webhook_url = f"{base_url.rstrip('/')}/webhook/{url_path}"
 
     log.info("Starting webhook on 0.0.0.0:%s | url=%s", port, webhook_url)
