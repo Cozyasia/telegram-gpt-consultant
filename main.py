@@ -308,24 +308,20 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_handler))
 
     # Параметры webhook для Render Web Service
-    port = int(os.getenv("PORT", "10000"))  # Render выставляет $PORT
-    url_path = token  # пусть путь будет секретным токеном
+        port = int(os.getenv("PORT", "10000"))     # Render даёт $PORT
+    url_path = token                            # путь = токен (секретный)
     webhook_url = f"{base_url.rstrip('/')}/webhook/{url_path}"
 
     logging.info(f"Starting webhook on 0.0.0.0:{port}, url={webhook_url}")
 
-    # Запускаем webhook-сервер (PTB сам поднимет aiohttp + health)
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=url_path,
-        webhook_url=webhook_url,
-        # можно указать secret_token для проверки X-Telegram-Bot-Api-Secret-Token
-        # secret_token=os.getenv("WEBHOOK_SECRET", None),
+        url_path=f"webhook/{url_path}",         # <-- оставляем только url_path
+        webhook_url=webhook_url,                # <-- публичный URL
+        # secret_token=os.getenv("WEBHOOK_SECRET"),  # если захочешь
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        webhook_path=f"/webhook/{url_path}",
     )
-
 if __name__ == "__main__":
     main()
