@@ -3,7 +3,8 @@ gspread==6.0.2
 google-auth==2.32.0
 google-auth-oauthlib==1.2.0
 cachetools==5.4.0
+oauthlib==3.2.2
 requests==2.32.3
 openai==1.42.0
+python-dateutil>=2.9.0
 dateparser==1.2.0
-python-dateutil==2.9.0.post0
