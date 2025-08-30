@@ -1,6 +1,7 @@
-# main.py
+# -*- coding: utf-8 -*-
 import os
 import json
+import time
 import logging
 from datetime import datetime
 
@@ -36,9 +37,9 @@ SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CREDS_RAW = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
 
 # OpenAI
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()     # sk-... или sk-proj-...
-OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "").strip()     # proj_..., если используешь project-key
-OPENAI_ORG     = os.environ.get("OPENAI_ORG", "").strip()         # org_..., опционально
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "").strip()
+OPENAI_ORG     = os.environ.get("OPENAI_ORG", "").strip()
 OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 if not TELEGRAM_TOKEN:
@@ -48,11 +49,9 @@ if not WEBHOOK_BASE or not WEBHOOK_BASE.startswith("http"):
 
 # ===================== OpenAI helpers =====================
 def _log_openai_env():
-    """Печатаем, что подтянулось из окружения + версию SDK."""
     if not OPENAI_API_KEY:
         log.warning("OpenAI disabled: no OPENAI_API_KEY")
         return
-
     try:
         import openai
         ver = getattr(openai, "__version__", "unknown")
@@ -68,17 +67,9 @@ def _log_openai_env():
         log.error("Failed to import openai: %s", e)
 
 def _probe_openai():
-    """
-    Разовая лёгкая самопроверка на старте:
-    - инициализация клиента
-    - короткий вызов chat.completions
-    Ничего не отправляем пользователю; только логи.
-    """
     if not OPENAI_API_KEY:
         return
-
     try:
-        # ИСПОЛЬЗУЕМ НОВЫЙ SDK
         from openai import OpenAI
         client = OpenAI(
             api_key=OPENAI_API_KEY,
@@ -86,16 +77,12 @@ def _probe_openai():
             organization=OPENAI_ORG or None,
             timeout=30,
         )
-        # Крошечный запрос для проверки
         _ = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=5,
         )
         log.info("OpenAI probe OK.")
-    except TypeError as e:
-        # На случай конфликта версий/неподдерживаемых аргументов – вывести максимально понятно.
-        log.error("OpenAI probe TypeError: %s", e)
     except Exception as e:
         log.error("OpenAI probe failed: %s", e)
 
@@ -150,18 +137,31 @@ def append_lead_row(row_values: list) -> bool:
         log.error("append_row failed: %s", e)
         return False
 
-# ===================== ТЕКСТЫ =====================
-def promo_block() -> str:
-    return (
-        """📎 Наши ресурсы\n\n"
-"🌐 Web site — http://cozy-asiath.com/\n"
-"📣 Telegram — @samuirental\n"
-"🏝️ Telegram — @arenda_vill_samui\n"
-"📸 Instagram — @cozy.asia\n"
-"👤 Чат с менеджером — @cozy_asia"
-        "👉 Готовы к подбору жилья? Напишите /rent — задам 7 коротких вопросов и передам менеджеру."""
-    )
+# ===================== РЕСУРСЫ/ССЫЛКИ =====================
+RESOURCES_HTML = (
+    "<b>📎 Наши ресурсы</b>\n\n"
+    "🌐 Web site — <a href='http://cozy-asiath.com/'>cozy-asiath.com</a>\n"
+    "📣 Telegram — <a href='https://t.me/samuirental'>@samuirental</a>\n"
+    "🏝️ Telegram — <a href='https://t.me/arenda_vill_samui'>@arenda_vill_samui</a>\n"
+    "📸 Instagram — <a href='https://www.instagram.com/cozy.asia'>@cozy.asia</a>\n"
+    "👤 Чат с менеджером — <a href='https://t.me/cozy_asia'>@cozy_asia</a>"
+)
+SHOW_LINKS_INTERVAL = 12 * 3600  # 12 часов
 
+async def send_resources_ctx(message, context: ContextTypes.DEFAULT_TYPE, force: bool=False):
+    """Шлём блок ресурсов; не чаще 12 часов на пользователя (если force=False)."""
+    now = time.time()
+    last = context.user_data.get("links_last_ts", 0)
+    if force or (now - last > SHOW_LINKS_INTERVAL):
+        await message.reply_text(RESOURCES_HTML, parse_mode="HTML", disable_web_page_preview=True)
+        context.user_data["links_last_ts"] = now
+
+LINK_KEYWORDS = (
+    "сайт","site","website","instagram","инстаграм","канал","телеграм",
+    "контакты","contact","support","links","ссылк","менеджер"
+)
+
+# ===================== ТЕКСТЫ =====================
 START_GREETING = (
     "✅ Я уже тут!\n"
     "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
@@ -179,7 +179,14 @@ RENT_INTRO = (
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(START_GREETING)
-    await update.effective_message.reply_text(promo_block())
+
+async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_resources_ctx(update.effective_message, context, force=True)
+
+async def maybe_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").lower()
+    if any(k in text for k in LINK_KEYWORDS):
+        await send_resources_ctx(update.effective_message, context, force=False)
 
 async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -231,7 +238,6 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Check-in: {ud.get('checkin','')}\n"
         f"Check-out: {ud.get('checkout','')}\n"
         f"Условия: {ud.get('notes','')}\n\n"
-        "Сейчас подберу и пришлю подходящие варианты, а менеджер уже в курсе и свяжется при необходимости. "
         "Можно продолжать свободное общение — спрашивайте про районы, сезонность и т.д."
     )
     await update.message.reply_text(summary)
@@ -281,6 +287,9 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error("Sheet append error: %s", e)
 
+    # Обязательная выдача «Наши ресурсы» после заявки
+    await send_resources_ctx(update.message, context, force=True)
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -291,7 +300,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===================== FREE CHAT =====================
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Свободное общение. Мягко ведём к /rent и всегда даём блок ресурсов."""
+    """Свободное общение. Мягко ведём к /rent."""
     text = (update.message.text or "").strip()
 
     if text.lower() == "rent":
@@ -308,9 +317,7 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             sys_prompt = (
                 "Ты ассистент Cozy Asia (Самуи). Всегда дружелюбен, краток и полезен. "
-                "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent. "
-                "Всегда давай наш аккуратный блок ресурсов отдельным абзацем в конце ответа:\n\n"
-                + promo_block()
+                "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent."
             )
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -331,7 +338,7 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.error("OpenAI chat error: %s", e)
 
     # Фоллбэк без OpenAI
-    fallback = "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n" + promo_block()
+    fallback = "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
     await update.message.reply_text(fallback)
 
 # ===================== BOOTSTRAP =====================
@@ -353,18 +360,21 @@ def build_application() -> Application:
         allow_reentry=True,
     )
 
+    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("links", cmd_links))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # Сначала "интуитивная" выдача ссылок по ключевым словам...
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_links))
+    # ...потом сам разговорный бот
     app.add_handler(rent_conv)
-    # ВАЖНО: болталка добавляется ПОСЛЕ rent_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
+
     return app
 
 def run_webhook(app: Application):
-    """
-    PTB 21.6: корректный запуск вебхука.
-    url_path должен совпадать с хвостом, который мы укажем Telegram при setWebhook.
-    """
+    """PTB 21.x: запуск вебхука."""
     url_path = f"webhook/{TELEGRAM_TOKEN}"
     webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/{url_path}"
     log.info("==> start webhook on 0.0.0.0:%s | url=%s", PORT, webhook_url)
@@ -380,7 +390,7 @@ def run_webhook(app: Application):
 
 def main():
     _log_openai_env()
-    _probe_openai()   # разовая проверка, чтобы сразу увидеть проблемы в логах
+    _probe_openai()
     app = build_application()
     run_webhook(app)
 
