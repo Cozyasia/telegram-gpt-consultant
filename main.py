@@ -254,30 +254,20 @@ async def finalize_rent(update: Update, context: ContextTypes.DEFAULT_TYPE, data
 # ИНИЦИАЛИЗАЦИЯ И ЗАПУСК (WEBHOOK)
 # ==========================
 
-def build_application() -> Application:
-    token = env("TELEGRAM_TOKEN")
-    app: Application = ApplicationBuilder().token(token).build()
+def run_webhook(app: Application):
+    # хвост вебхука должен совпадать с тем, что передаём в run_webhook
+    url_path = f"webhook/{TELEGRAM_TOKEN}"
+    webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/{url_path}"
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("rent", cmd_rent))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    log.info("==> start webhook on 0.0.0.0:%s | url=%s", PORT, webhook_url)
 
-    return app
-
-def run_webhook(app: Application) -> None:
-    base = env("WEBHOOK_BASE").rstrip("/")
-    path = env("WEBHOOK_PATH", "/webhook")
-    port = int(env("PORT", "10000"))
-    webhook_url = f"{base}{path}"
-
-    # run_webhook сам управляет установкой вебхука
     app.run_webhook(
         listen="0.0.0.0",
-        port=port,
-        url=webhook_url,
-        webhook_path=path,
+        port=PORT,
+        url_path=url_path,
+        webhook_url=webhook_url,       # ВАЖНО: именно webhook_url, не url
         drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+        # allowed_updates=Update.ALL_TYPES  # можно не указывать
     )
 
 if __name__ == "__main__":
