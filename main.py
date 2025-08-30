@@ -28,8 +28,11 @@ PORT             = int(os.environ.get("PORT", "10000"))
 GROUP_CHAT_ID    = os.environ.get("GROUP_CHAT_ID", "").strip()               # -100xxxxxxxxxx
 SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CREDS_RAW = os.environ.get("GOOGLE_CREDS_JSON", "").strip()           # МНОГОстрочный JSON
-OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()              # опционально
-OPENAI_MODEL     = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()     # опционально
+
+# GPT (опционально)
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL     = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_BASE      = os.environ.get("OPENAI_BASE", "").strip()  # опционально: кастомный endpoint
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("ENV TELEGRAM_TOKEN is required")
@@ -229,60 +232,70 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Окей, отменил анкету. Можем просто пообщаться или запустить /rent позже.")
     return ConversationHandler.END
 
-# ===================== FREE CHAT (асинхронный OpenAI + фоллбэк) =====================
+# ===================== GPT (болталка) =====================
+def build_openai_client():
+    """Создаёт клиента OpenAI. Работает и с дефолтным, и с кастомным base_url."""
+    from openai import OpenAI
+    if not OPENAI_API_KEY:
+        log.info("OpenAI disabled: no OPENAI_API_KEY in env")
+        return None
+    try:
+        if OPENAI_BASE:
+            return OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE)
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        log.error("OpenAI client init error: %s", e)
+        return None
+
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Болталка. Если есть OPENAI_API_KEY — спрашиваем модель асинхронно (не блокируем event-loop).
-    При любой ошибке/таймауте даём аккуратный фоллбэк и подталкиваем к /rent.
-    """
+    """Болталка. Если есть OPENAI_API_KEY — отвечаем через GPT, иначе — аккуратный фоллбэк."""
     text = (update.message.text or "").strip()
 
     # Если пользователь сам пишет "rent" — сразу в анкету
     if text.lower() == "rent":
         return await cmd_rent(update, context)
 
+    client = build_openai_client()
+    if client:
+        try:
+            sys_prompt = (
+                "Ты ассистент Cozy Asia (Самуи). Отвечай дружелюбно, по делу и без воды. "
+                "Если разговор касается аренды/покупки жилья — мягко предложи пройти анкету командой /rent. "
+                "ВСЕГДА завершай ответ отдельным аккуратным блоком ресурсов (как в примере ниже):\n\n"
+                + promo_block()
+            )
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.6,
+                max_tokens=600,
+                timeout=20,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+
+            # Гарантированно ведём к анкете, если речь о жилье
+            trigger_words = ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье", "апартаменты", "подбор"]
+            if "/rent" not in answer and any(w in text.lower() for w in trigger_words):
+                answer += "\n\n👉 Чтобы оформить запрос на подбор — напишите /rent."
+
+            # Если блок ресурсов вдруг отсутствует — добавим
+            if "Наши ресурсы:" not in answer:
+                answer += "\n\n" + promo_block()
+
+            await update.message.reply_text(answer)
+            return
+        except Exception as e:
+            log.error("OpenAI request error: %s", e)
+
+    # Фоллбэк без GPT или при ошибке
     fallback = (
-        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n" + promo_block()
+        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n"
+        + promo_block()
     )
-
-    if not OPENAI_API_KEY:
-        await update.message.reply_text(fallback)
-        return
-
-    try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=12.0)
-
-        sys_prompt = (
-            "Ты ассистент Cozy Asia (о. Самуи). Всегда дружелюбен и полезен. "
-            "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent. "
-            "В ответах периодически и красиво напоминай о наших ресурсах (каждый блок с эмодзи и новой строкой), "
-            "но не дублируй ресурсы слишком часто:\n"
-            "🌐 Сайт — https://cozy.asia\n"
-            "📣 Канал — https://t.me/cozy_asia\n"
-            "📘 Правила/FAQ — https://t.me/cozy_asia_rules"
-        )
-
-        resp = await client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.6,
-        )
-
-        answer = (resp.choices[0].message.content or "").strip()
-        if "/rent" not in answer.lower() and any(
-            k in text.lower() for k in ("снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье", "buy", "rent")
-        ):
-            answer += "\n\n👉 Чтобы оформить запрос на подбор — напишите /rent."
-
-        await update.message.reply_text(answer or fallback)
-
-    except Exception as e:
-        log.error("OpenAI (free_text) error: %s", e)
-        await update.message.reply_text(fallback)
+    await update.message.reply_text(fallback)
 
 # ===================== BOOTSTRAP =====================
 def build_application() -> Application:
