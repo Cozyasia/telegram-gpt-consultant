@@ -1,262 +1,233 @@
 # main.py
-# Cozy Asia Bot — финальная стабильная сборка (вебхук для Render)
-# Требуемые ENV:
-# TELEGRAM_TOKEN, WEBHOOK_BASE (например https://<service>.onrender.com),
-# WEBHOOK_PATH (например /webhook), PORT (например 10000),
-# GROUP_CHAT_ID (число, ид чата для уведомлений, может быть отрицательным),
-# GOOGLE_CREDS_JSON (полный JSON сервис-аккаунта в одну строку),
-# GOOGLE_SHEET_ID или GOOGLE_SHEET_URL (любой один из них)
-
-import os
-import json
-import asyncio
+import os, json, logging, re
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Dict, Any, List, Optional
 
+import dateparser
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 
-from dateutil import parser as dateparser  # уже используется в твоём проекте
-from telegram import Update
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, ApplicationBuilder, ContextTypes,
+    CommandHandler, MessageHandler, filters
 )
 
-# ==========================
-# ТЕКСТЫ: приветствие и брендинг
-# ==========================
-
-START_TEXT = (
-    "✅ Я уже тут!\n"
-    "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
-    "👉 Или нажмите команду <b>/rent</b> — я задам несколько вопросов о жилье, "
-    "сформирую заявку, предложу варианты и передам менеджеру. Он свяжется с вами "
-    "для уточнения деталей и бронирования."
+# -------------------- ЛОГИ --------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
+log = logging.getLogger("cozyasia-bot")
 
-BRAND_BLOCK = (
-    "🔗 <b>Полезные ссылки Cozy Asia</b>\n"
-    "🌐 Сайт: <a href=\"https://cozy.asia\">cozy.asia</a>\n"
-    "📣 Канал о виллах и жизни на Самуи: <a href=\"https://t.me/cozy_asia\">@cozy_asia</a>\n"
-    "📜 Гайды и правила: <a href=\"https://t.me/cozy_asia_rules\">@cozy_asia_rules</a>\n"
-    "👤 Менеджер: <a href=\"https://t.me/cozy_asia_manager\">@cozy_asia_manager</a>\n\n"
-    "✳️ Чтобы перейти к подбору — напишите <b>/rent</b>."
-)
+# -------------------- УТИЛИТЫ --------------------
+def env(key: str, default: Optional[str] = None) -> str:
+    val = os.environ.get(key)
+    if val is None:
+        if default is not None:
+            return default
+        raise RuntimeError(f"ENV {key} is required")
+    return val
 
-CTA_SHORT = (
-    "🧭 Нужен персональный подбор жилья? Напишите <b>/rent</b> — запущу короткую анкету "
-    "и передам менеджеру."
-)
+def parse_int(s: str) -> Optional[int]:
+    if s is None:
+        return None
+    digits = re.sub(r"[^\d]", "", s)
+    return int(digits) if digits else None
 
-# ==========================
-# ВСПОМОГАТЕЛЬНОЕ
-# ==========================
+def parse_date_human(s: str) -> Optional[str]:
+    if not s:
+        return None
+    dt = dateparser.parse(s)
+    return dt.strftime("%Y-%m-%d") if dt else None
 
-RENT_FIELDS = [
-    ("type",      "1/7: какой тип жилья интересует? <i>(квартира/дом/вилла)</i>"),
-    ("area",      "2/7: район/локация на Самуи <i>(например: Ламай, Маенам, Бопут…)</i>"),
-    ("bedrooms",  "3/7: сколько спален нужно?"),
-    ("budget",    "4/7: бюджет в батах (за месяц)"),
-    ("checkin",   "5/7: дата заезда <i>(любой формат: 2025-12-01, 01.12.2025…)</i>"),
-    ("checkout",  "6/7: дата выезда <i>(любой формат)</i>"),
-    ("notes",     "7/7: важные условия/примечания <i>(питомцы, бассейн, парковка…)</i>"),
-]
+def now_utc_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-def env(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name, default)
-    if v is None:
-        raise RuntimeError(f"ENV {name} is required")
-    return v
+# -------------------- НАСТРОЙКИ/ССЫЛКИ --------------------
+SITE_URL        = os.environ.get("SITE_URL", "https://cozy.asia")
+CHANNEL_PUBLIC  = os.environ.get("CHANNEL_PUBLIC", "https://t.me/cozy_asia")
+CHANNEL_SALES   = os.environ.get("CHANNEL_SALES", "https://t.me/cozyasia_sales")
+MANAGER_LINK    = os.environ.get("MANAGER_LINK", "https://t.me/cozy_asia")
 
-def try_parse_date(text: str) -> str:
-    try:
-        dt = dateparser.parse(text, dayfirst=True)
-        if dt:
-            return dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
-    return text.strip()
+def resources_block() -> str:
+    # красивый блок ссылок всегда ведём к /rent
+    lines = [
+        "📌 **Полезные ссылки Cozy Asia**",
+        f"🌐 Сайт: {SITE_URL}",
+        f"📣 Канал: {CHANNEL_PUBLIC}",
+        f"🏡 Подбор/продажи: {CHANNEL_SALES}",
+        f"👤 Написать менеджеру: {MANAGER_LINK}",
+        "",
+        "👉 Готовы к подбору? Нажмите /rent — оформим заявку и свяжем с менеджером."
+    ]
+    return "\n".join(lines)
 
-# ==========================
-# GOOGLE SHEETS
-# ==========================
-
+# -------------------- GOOGLE SHEETS --------------------
 _gs_client = None
-_gs_worksheet = None
+_sheet = None
 
-def gs_init_once() -> None:
-    """Ленивая инициализация клиента и таблицы (один раз на процесс)."""
-    global _gs_client, _gs_worksheet
-    if _gs_client and _gs_worksheet:
+def init_sheets() -> None:
+    global _gs_client, _sheet
+    if _sheet:
         return
 
-    creds_json_raw = env("GOOGLE_CREDS_JSON")
-    # допускаем как «однострочный JSON», так и с \n — оба варианта у тебя встречались
-    creds_info = json.loads(creds_json_raw)
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    _gs_client = gspread.authorize(credentials)
-
-    sheet_id = os.getenv("GOOGLE_SHEET_ID")
-    sheet_url = os.getenv("GOOGLE_SHEET_URL")
-    if sheet_id:
-        sh = _gs_client.open_by_key(sheet_id)
-    elif sheet_url:
-        sh = _gs_client.open_by_url(sheet_url)
-    else:
-        raise RuntimeError("ENV GOOGLE_SHEET_ID or GOOGLE_SHEET_URL is required")
-
-    # вкладка Leads (создастся автоматически, если её ещё нет)
+    creds_json = env("GOOGLE_CREDS_JSON")
     try:
-        _gs_worksheet = sh.worksheet("Leads")
-    except gspread.exceptions.WorksheetNotFound:
-        _gs_worksheet = sh.add_worksheet(title="Leads", rows=1000, cols=20)
-        _gs_worksheet.append_row([
-            "created_at", "chat_id", "username",
-            "type", "area", "bedrooms", "budget",
-            "checkin", "checkout", "notes"
-        ])
+        # допускаем многострочный JSON из переменной окружения
+        info = json.loads(creds_json)
+    except json.JSONDecodeError:
+        # иногда переносы / экранирование — пробуем безопасно
+        info = json.loads(creds_json.encode("utf-8").decode("unicode_escape"))
 
-def gs_append_lead(row: list) -> None:
-    gs_init_once()
-    _gs_worksheet.append_row(row, value_input_option="USER_ENTERED")
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+    _gs_client = gspread.authorize(creds)
 
-# ==========================
-# ХЕНДЛЕРЫ
-# ==========================
+    sheet_id = env("GOOGLE_SHEETS_ID")
+    sh = _gs_client.open_by_key(sheet_id)
+    _sheet = sh.worksheet("Leads")  # имя вкладки как в твоей таблице
 
+def write_lead_row(row: List[Any]) -> None:
+    init_sheets()
+    _sheet.append_row(row, value_input_option="USER_ENTERED")
+
+# -------------------- СОСТОЯНИЕ ОПРОСА --------------------
+# Храним состояние опроса прямо в user_data
+QUESTIONS = [
+    ("type",     "1/7: какой тип жилья интересует? (квартира/дом/вилла)"),
+    ("people",   "2/7: на сколько человек? (числом)"),
+    ("budget",   "3/7: бюджет (в бат/ночь или мес., любым форматом)"),
+    ("location", "4/7: какой район Самуи предпочитаете?"),
+    ("checkin",  "5/7: дата заезда (любой формат: 2025-12-01, 01.12.2025 и т. п.)"),
+    ("checkout", "6/7: дата выезда (любой формат)"),
+    ("notes",    "7/7: важные условия/примечания (питомцы, бассейн, парковка и т.п.)"),
+]
+
+START_GREETING = (
+    "✅ Я уже тут!\n"
+    "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
+    "👉 Или нажмите команду /rent — я задам несколько вопросов о жилье, "
+    "сформирую заявку, предложу варианты и передам менеджеру. Он свяжется с вами для уточнения деталей и бронирования."
+)
+
+def reset_flow(data: Dict[str, Any]) -> None:
+    data["flow"] = None
+    data["answers"] = {}
+    data["q_index"] = 0
+
+# -------------------- ХЕНДЛЕРЫ --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    await context.bot.send_message(
-        chat_id=chat_id, text=START_TEXT, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-    )
-    await context.bot.send_message(
-        chat_id=chat_id, text=BRAND_BLOCK, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-    )
+    reset_flow(context.user_data)
+    await update.message.reply_text(START_GREETING)
 
 async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["rent"] = {"step": 0, "data": {}}
-    await update.message.reply_text(RENT_FIELDS[0][1], parse_mode=ParseMode.HTML)
-
-def is_in_rent(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return "rent" in context.user_data and isinstance(context.user_data["rent"], dict)
+    reset_flow(context.user_data)
+    context.user_data["flow"] = "rent"
+    await update.message.reply_text("Запускаю короткую анкету. Вопрос 1.")
+    await update.message.reply_text(QUESTIONS[0][1])
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
 
-    # В процессе анкеты
-    if is_in_rent(context):
-        rent = context.user_data["rent"]
-        step = rent.get("step", 0)
-        data = rent.get("data", {})
+    # если в режиме опроса
+    if context.user_data.get("flow") == "rent":
+        q_index = context.user_data.get("q_index", 0)
+        key, _ = QUESTIONS[q_index]
+        context.user_data.setdefault("answers", {})[key] = text
 
-        key, prompt = RENT_FIELDS[step]
-        value = text
+        q_index += 1
+        context.user_data["q_index"] = q_index
 
-        # аккуратно нормализуем даты
-        if key in ("checkin", "checkout"):
-            value = try_parse_date(value)
-
-        data[key] = value
-        rent["data"] = data
-        step += 1
-
-        if step < len(RENT_FIELDS):
-            rent["step"] = step
-            context.user_data["rent"] = rent
-            await update.message.reply_text(RENT_FIELDS[step][1], parse_mode=ParseMode.HTML)
+        if q_index < len(QUESTIONS):
+            await update.message.reply_text(QUESTIONS[q_index][1])
             return
 
-        # анкета завершена -> сохраняем и уведомляем
-        context.user_data.pop("rent", None)
-        await finalize_rent(update, context, data)
+        # анкета завершена -> формируем
+        ans = context.user_data["answers"]
+        chat = update.effective_chat
+        username = (update.effective_user.username or "—")
+        chat_id = chat.id
+
+        # нормализуем цифры/даты
+        people  = parse_int(ans.get("people", ""))
+        budget  = parse_int(ans.get("budget", ""))
+        checkin = parse_date_human(ans.get("checkin", ""))
+        checkout= parse_date_human(ans.get("checkout", ""))
+
+        # запись в таблицу
+        try:
+            write_lead_row([
+                now_utc_str(),
+                str(chat_id),
+                username,
+                ans.get("location", ""),
+                ans.get("type", ""),
+                budget if budget is not None else ans.get("budget", ""),
+                people if people is not None else ans.get("people", ""),
+                ans.get("notes", ""),
+                checkin or ans.get("checkin", ""),
+                checkout or ans.get("checkout", ""),
+            ])
+        except Exception as e:
+            log.exception("Sheets append failed")
+            await update.message.reply_text("⚠️ Не удалось записать в таблицу (мы это уже правим). Заявка все равно принята.")
+
+        # уведомление в рабочую группу
+        try:
+            group_id = int(env("GROUP_CHAT_ID"))
+            await context.bot.send_message(
+                chat_id=group_id,
+                text=(
+                    "🆕 **Новая заявка Cozy Asia**\n"
+                    f"Клиент: @{username} (ID: {chat_id})\n"
+                    f"Тип: {ans.get('type','')}\n"
+                    f"Район: {ans.get('location','')}\n"
+                    f"Бюджет: {budget if budget is not None else ans.get('budget','')}\n"
+                    f"Спален: {people if people is not None else ans.get('people','')}\n"
+                    f"Check-in: {checkin or ans.get('checkin','')}\n"
+                    f"Check-out: {checkout or ans.get('checkout','')}\n"
+                    f"Условия/прим.: {ans.get('notes','')}\n"
+                    f"Создано: {now_utc_str()} UTC"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            log.exception("Group notify failed")
+
+        # подтверждение клиенту
+        await update.message.reply_text(
+            "📝 Заявка сформирована и передана менеджеру.\n\n"
+            f"Тип: {ans.get('type','')}\n"
+            f"Район: {ans.get('location','')}\n"
+            f"Спален: {people if people is not None else ans.get('people','')}\n"
+            f"Бюджет: {budget if budget is not None else ans.get('budget','')}\n"
+            f"Check-in: {checkin or ans.get('checkin','')}\n"
+            f"Check-out: {checkout or ans.get('checkout','')}\n"
+            f"Условия: {ans.get('notes','')}\n\n"
+            "Сейчас подберу и пришлю подходящие варианты, а менеджер уже в курсе и свяжется при необходимости. "
+            "Можно продолжать свободное общение — спрашивайте про районы, сезонность и т.д."
+        )
+
+        reset_flow(context.user_data)
         return
 
-    # Свободное общение: выводим короткий CTA + бренд-блок
-    await update.message.reply_text(CTA_SHORT, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    await update.message.reply_text(BRAND_BLOCK, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-async def finalize_rent(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
-    # 1) Сохраняем в таблицу
-    try:
-        created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        chat_id = update.effective_chat.id
-        username = (update.effective_user.username or "—")
-        row = [
-            created_at, str(chat_id), username,
-            data.get("type", ""), data.get("area", ""), data.get("bedrooms", ""),
-            data.get("budget", ""), data.get("checkin", ""), data.get("checkout", ""),
-            data.get("notes", "")
-        ]
-        gs_append_lead(row)
-        saved_ok = True
-    except Exception as e:
-        saved_ok = False
-
-    # 2) Сообщение пользователю (резюме заявки)
-    card = (
-        "📝 <b>Заявка сформирована и передана менеджеру.</b>\n\n"
-        f"Тип: {data.get('type','')}\n"
-        f"Район: {data.get('area','')}\n"
-        f"Спален: {data.get('bedrooms','')}\n"
-        f"Бюджет: {data.get('budget','')}\n"
-        f"Check-in: {data.get('checkin','')}\n"
-        f"Check-out: {data.get('checkout','')}\n"
-        f"Условия: {data.get('notes','')}\n\n"
-        "Сейчас подберу и пришлю подходящие варианты, а менеджер уже в курсе и свяжется при необходимости. "
-        "Можно продолжать свободное общение — спрашивайте про районы, сезонность и т.д."
+    # свободный диалог → всегда ненавязчиво ведём к /rent и даём блок ресурсов
+    # (тут можно вставлять свою генерацию ответов/руководства)
+    reply = (
+        "Понимаю. Могу подсказать по острову, районам и сезонности. "
+        "Если цель — подобрать жильё под ваши параметры, быстрее всего пройти короткий опрос — команда /rent.\n\n"
+        + resources_block()
     )
-    await update.message.reply_text(card, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
-    # 3) Уведомление в рабочую группу
-    try:
-        group_id = int(env("GROUP_CHAT_ID"))
-        uname = update.effective_user.username
-        mention = f"@{uname}" if uname else "@—"
-        created_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-        group_msg = (
-            "🆕 <b>Новая заявка Cozy Asia</b>\n"
-            f"Клиент: {mention} (ID: {update.effective_user.id})\n"
-            f"Тип: {data.get('type','')}\n"
-            f"Район: {data.get('area','')}\n"
-            f"Бюджет: <a href=\"https://t.me/{uname}\">{data.get('budget','')}</a>\n" if uname else
-            f"Бюджет: {data.get('budget','')}\n"
-        )
-        group_msg += (
-            f"Спален: {data.get('bedrooms','')}\n"
-            f"Check-in: {data.get('checkin','')}\n"
-            f"Check-out: {data.get('checkout','')}\n"
-            f"Условия/прим.: {data.get('notes','')}\n"
-            f"Создано: {created_utc}"
-        )
-
-        await context.bot.send_message(
-            chat_id=group_id,
-            text=group_msg,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
-    except Exception:
-        pass
-
-# ==========================
-# ИНИЦИАЛИЗАЦИЯ И ЗАПУСК (WEBHOOK)
-# ==========================
-
+# -------------------- ИНИЦИАЛИЗАЦИЯ --------------------
 def build_application() -> Application:
     token = env("TELEGRAM_TOKEN")
-    app: Application = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rent", cmd_rent))
@@ -268,16 +239,17 @@ def run_webhook(app: Application) -> None:
     base = env("WEBHOOK_BASE").rstrip("/")
     path = env("WEBHOOK_PATH", "/webhook")
     port = int(env("PORT", "10000"))
-    webhook_url = f"{base}{path}"
+    public_url = f"{base}{path}"
 
-    # run_webhook сам управляет установкой вебхука
+    log.info("=> run_webhook port=%s url=%s", port, public_url)
+
+    # ВАЖНО: для твоей версии PTB нужен параметр webhook_url
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url=webhook_url,
         webhook_path=path,
+        webhook_url=public_url,
         drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
     )
 
 if __name__ == "__main__":
