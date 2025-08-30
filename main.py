@@ -22,23 +22,44 @@ logging.basicConfig(
 )
 log = logging.getLogger("cozyasia-bot")
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "").strip()
-WEBHOOK_BASE     = os.environ.get("WEBHOOK_BASE", "").strip()                 # https://<service>.onrender.com
-PORT             = int(os.environ.get("PORT", "10000"))
-GROUP_CHAT_ID    = os.environ.get("GROUP_CHAT_ID", "").strip()               # -100xxxxxxxxxx
+# Telegram & Webhook
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+WEBHOOK_BASE   = os.environ.get("WEBHOOK_BASE", "").strip()   # https://<service>.onrender.com
+PORT           = int(os.environ.get("PORT", "10000"))
+
+# Group for notifications
+GROUP_CHAT_ID  = os.environ.get("GROUP_CHAT_ID", "").strip()  # -100xxxxxxxxxx
+
+# Google Sheets
 SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CREDS_RAW = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
 
-# ---- OpenAI ----
-OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()              # sk-… или sk-proj-…
-OPENAI_MODEL     = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
-OPENAI_PROJECT   = os.environ.get("OPENAI_PROJECT", "").strip()               # prj_… (для project-key)
-OPENAI_ORG       = os.environ.get("OPENAI_ORG", "").strip()                   # org_… (необязательно)
+# OpenAI
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()     # user-key sk-... или project-key sk-proj-...
+OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "").strip()     # proj_..., если используешь project-key
+OPENAI_ORG     = os.environ.get("OPENAI_ORG", "").strip()         # org_..., опционально
+OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("ENV TELEGRAM_TOKEN is required")
 if not WEBHOOK_BASE or not WEBHOOK_BASE.startswith("http"):
     raise RuntimeError("ENV WEBHOOK_BASE must be your Render URL like https://xxx.onrender.com")
+
+def _print_openai_cfg():
+    """Удобный лог — сразу видно, что именно подтянулось из окружения."""
+    if not OPENAI_API_KEY:
+        log.warning("OpenAI disabled: no OPENAI_API_KEY")
+        return
+    subtype = "user-key"
+    if OPENAI_API_KEY.startswith("sk-proj-"):
+        subtype = "project-key"
+    log.info(
+        "OpenAI ready | type=%s | model=%s | project=%s | org=%s",
+        subtype,
+        OPENAI_MODEL,
+        (OPENAI_PROJECT or "—"),
+        (OPENAI_ORG or "—"),
+    )
 
 # ===================== GOOGLE SHEETS (ленивая инициализация) =====================
 _gspread = None
@@ -80,6 +101,7 @@ def _init_sheets_once():
         _worksheet = None
 
 def append_lead_row(row_values: list) -> bool:
+    """Добавить строку в таблицу (если настроено)."""
     _init_sheets_once()
     if _worksheet is None:
         return False
@@ -92,6 +114,7 @@ def append_lead_row(row_values: list) -> bool:
 
 # ===================== ТЕКСТЫ =====================
 def promo_block() -> str:
+    """Опрятный блок с ресурсами и мягким переводом к анкете."""
     return (
         "📎 Наши ресурсы:\n"
         "🌐 Сайт — каталог и контакты\n"
@@ -208,14 +231,14 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id if update.effective_chat else ""
         username = update.effective_user.username if (update.effective_user and update.effective_user.username) else ""
         row = [
-            created, str(chat_id), username,
-            ud.get("district",""),
-            ud.get("bedrooms",""),
-            ud.get("budget",""),
-            ud.get("checkin",""),
-            ud.get("checkout",""),
-            ud.get("type",""),
-            ud.get("notes",""),
+            created, str(chat_id), username,            # created_at, chat_id, username
+            ud.get("district",""),                      # location
+            ud.get("bedrooms",""),                      # bedrooms
+            ud.get("budget",""),                        # budget
+            ud.get("checkin",""),                       # checkin
+            ud.get("checkout",""),                      # checkout
+            ud.get("type",""),                          # type
+            ud.get("notes",""),                         # notes
         ]
         ok = append_lead_row(row)
         if not ok:
@@ -231,29 +254,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Окей, отменил анкету. Можем просто пообщаться или запустить /rent позже.")
     return ConversationHandler.END
 
-# ===================== OpenAI helper =====================
-def _build_openai_client():
-    """
-    Поддерживает оба типа ключей:
-    - обычный sk-… (ничего больше не нужно)
-    - project-key sk-proj-… (нужно указать OPENAI_PROJECT=prj_…; OPENAI_ORG опционально)
-    """
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        from openai import OpenAI
-        kwargs = {"api_key": OPENAI_API_KEY}
-        if OPENAI_PROJECT:
-            kwargs["project"] = OPENAI_PROJECT
-        if OPENAI_ORG:
-            kwargs["organization"] = OPENAI_ORG
-        client = OpenAI(**kwargs)
-        return client
-    except Exception as e:
-        log.error("OpenAI import/init error: %s", e)
-        return None
-
-# ===================== FREE CHAT =====================
+# ===================== FREE CHAT (OpenAI with project/org support) =====================
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Болталка. Всегда ведём к /rent и показываем ресурсы."""
     text = (update.message.text or "").strip()
@@ -262,20 +263,21 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.lower() == "rent":
         return await cmd_rent(update, context)
 
-    client = _build_openai_client()
-
-    if client:
+    if OPENAI_API_KEY:
         try:
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=OPENAI_API_KEY,
+                project=OPENAI_PROJECT or None,
+                organization=OPENAI_ORG or None,
+                timeout=30,
+            )
             sys_prompt = (
                 "Ты ассистент Cozy Asia (Самуи). Всегда дружелюбен, краток и полезен. "
                 "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent. "
                 "Всегда давай наш аккуратный блок ресурсов отдельным абзацем в конце ответа:\n\n"
                 + promo_block()
             )
-            # Небольшой таймаут на уровне транспорта
-            from httpx import Timeout
-            timeout = Timeout(15.0, connect=10.0)
-
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
@@ -283,26 +285,20 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     {"role": "user", "content": text},
                 ],
                 temperature=0.6,
-                timeout=timeout,   # поддерживается OpenAI SDK 1.x (проксируется в httpx)
             )
             answer = (resp.choices[0].message.content or "").strip()
-            if "/rent" not in answer and any(k in text.lower() for k in ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье"]):
+            if "/rent" not in answer and any(
+                k in text.lower() for k in ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье"]
+            ):
                 answer += "\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
-            if answer:
-                await update.message.reply_text(answer)
-                return
-            else:
-                log.warning("OpenAI returned empty content")
+            await update.message.reply_text(answer)
+            return
         except Exception as e:
-            # Максимально подробный лог, чтобы было видно причину в Render
-            log.error("OpenAI error (model=%s, project=%s, org=%s): %s",
-                      OPENAI_MODEL, OPENAI_PROJECT or "-", OPENAI_ORG or "-", e)
+            # Максимально подробный лог, чтобы в Render Logs было видно, что не так.
+            log.error("OpenAI chat error: %s", e)
 
-    # Фоллбэк без OpenAI / при ошибке
-    fallback = (
-        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n"
-        + promo_block()
-    )
+    # Фоллбэк без OpenAI
+    fallback = "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n" + promo_block()
     await update.message.reply_text(fallback)
 
 # ===================== BOOTSTRAP =====================
@@ -327,10 +323,15 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(rent_conv)
+    # ВАЖНО: болталка добавляется ПОСЛЕ rent_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
     return app
 
 def run_webhook(app: Application):
+    """
+    PTB 21.6: корректный запуск вебхука.
+    url_path должен совпадать с хвостом, который мы укажем Telegram при setWebhook.
+    """
     url_path = f"webhook/{TELEGRAM_TOKEN}"
     webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/{url_path}"
     log.info("==> start webhook on 0.0.0.0:%s | url=%s", PORT, webhook_url)
@@ -345,6 +346,7 @@ def run_webhook(app: Application):
     )
 
 def main():
+    _print_openai_cfg()
     app = build_application()
     run_webhook(app)
 
