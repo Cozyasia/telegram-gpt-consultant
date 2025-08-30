@@ -3,6 +3,7 @@ import os
 import json
 import logging
 from datetime import datetime
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -35,7 +36,7 @@ SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_CREDS_RAW = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
 
 # OpenAI
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()     # user-key sk-... или project-key sk-proj-...
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()     # sk-... или sk-proj-...
 OPENAI_PROJECT = os.environ.get("OPENAI_PROJECT", "").strip()     # proj_..., если используешь project-key
 OPENAI_ORG     = os.environ.get("OPENAI_ORG", "").strip()         # org_..., опционально
 OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
@@ -46,7 +47,6 @@ if not WEBHOOK_BASE or not WEBHOOK_BASE.startswith("http"):
     raise RuntimeError("ENV WEBHOOK_BASE must be your Render URL like https://xxx.onrender.com")
 
 def _print_openai_cfg():
-    """Удобный лог — сразу видно, что именно подтянулось из окружения."""
     if not OPENAI_API_KEY:
         log.warning("OpenAI disabled: no OPENAI_API_KEY")
         return
@@ -55,10 +55,7 @@ def _print_openai_cfg():
         subtype = "project-key"
     log.info(
         "OpenAI ready | type=%s | model=%s | project=%s | org=%s",
-        subtype,
-        OPENAI_MODEL,
-        (OPENAI_PROJECT or "—"),
-        (OPENAI_ORG or "—"),
+        subtype, OPENAI_MODEL, (OPENAI_PROJECT or "—"), (OPENAI_ORG or "—"),
     )
 
 # ===================== GOOGLE SHEETS (ленивая инициализация) =====================
@@ -66,7 +63,6 @@ _gspread = None
 _worksheet = None
 
 def _init_sheets_once():
-    """Подключаемся к Google Sheets один раз по требованию."""
     global _gspread, _worksheet
     if _worksheet is not None:
         return
@@ -94,14 +90,13 @@ def _init_sheets_once():
         try:
             _worksheet = sh.worksheet("Leads")
         except Exception:
-            _worksheet = sh.sheet1  # fallback если нет листа "Leads"
+            _worksheet = sh.sheet1
         log.info("Google Sheets ready: %s", _worksheet.title)
     except Exception as e:
         log.error("Failed to init Google Sheets: %s", e)
         _worksheet = None
 
 def append_lead_row(row_values: list) -> bool:
-    """Добавить строку в таблицу (если настроено)."""
     _init_sheets_once()
     if _worksheet is None:
         return False
@@ -112,9 +107,8 @@ def append_lead_row(row_values: list) -> bool:
         log.error("append_row failed: %s", e)
         return False
 
-# ===================== ТЕКСТЫ =====================
+# ===================== PROMO/TEXTS =====================
 def promo_block() -> str:
-    """Опрятный блок с ресурсами и мягким переводом к анкете."""
     return (
         "📎 Наши ресурсы:\n"
         "🌐 Сайт — каталог и контакты\n"
@@ -129,8 +123,7 @@ def promo_block() -> str:
 START_GREETING = (
     "✅ Я уже тут!\n"
     "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
-    "👉 Или нажмите команду /rent — я задам несколько вопросов о жилье, сформирую заявку, предложу варианты и передам менеджеру. "
-    "Он свяжется с вами для уточнения деталей и бронирования."
+    "👉 Или нажмите команду /rent — я задам несколько вопросов о жилье, сформирую заявку, предложу варианты и передам менеджеру."
 )
 
 RENT_INTRO = (
@@ -196,12 +189,10 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Check-in: {ud.get('checkin','')}\n"
         f"Check-out: {ud.get('checkout','')}\n"
         f"Условия: {ud.get('notes','')}\n\n"
-        "Сейчас подберу и пришлю подходящие варианты, а менеджер уже в курсе и свяжется при необходимости. "
         "Можно продолжать свободное общение — спрашивайте про районы, сезонность и т.д."
     )
     await update.message.reply_text(summary)
 
-    # Уведомление в рабочую группу
     try:
         if GROUP_CHAT_ID:
             mention = (
@@ -225,20 +216,19 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error("Failed to notify group: %s", e)
 
-    # Запись в таблицу
     try:
         created = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         chat_id = update.effective_chat.id if update.effective_chat else ""
         username = update.effective_user.username if (update.effective_user and update.effective_user.username) else ""
         row = [
-            created, str(chat_id), username,            # created_at, chat_id, username
-            ud.get("district",""),                      # location
-            ud.get("bedrooms",""),                      # bedrooms
-            ud.get("budget",""),                        # budget
-            ud.get("checkin",""),                       # checkin
-            ud.get("checkout",""),                      # checkout
-            ud.get("type",""),                          # type
-            ud.get("notes",""),                         # notes
+            created, str(chat_id), username,
+            ud.get("district",""),
+            ud.get("bedrooms",""),
+            ud.get("budget",""),
+            ud.get("checkin",""),
+            ud.get("checkout",""),
+            ud.get("type",""),
+            ud.get("notes",""),
         ]
         ok = append_lead_row(row)
         if not ok:
@@ -254,48 +244,106 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Окей, отменил анкету. Можем просто пообщаться или запустить /rent позже.")
     return ConversationHandler.END
 
-# ===================== FREE CHAT (OpenAI with project/org support) =====================
+# ===================== OpenAI helpers =====================
+def _get_openai_client():
+    """
+    Возвращает и кэширует клиент OpenAI или None (если ключа нет).
+    """
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            project=OPENAI_PROJECT or None,
+            organization=OPENAI_ORG or None,
+            timeout=60,           # общий таймаут
+            max_retries=2,
+        )
+        return client
+    except Exception as e:
+        log.error("Failed to init OpenAI client: %s", e)
+        return None
+
+async def _probe_openai():
+    """
+    Маленькая проверка при старте, чтобы в логах сразу было понятно,
+    работает ли ключ/проект/модель.
+    """
+    client = _get_openai_client()
+    if not client:
+        return
+    try:
+        # Запускаем синхронный вызов в пуле, чтобы не блокировать event loop
+        import asyncio
+        def _call():
+            return client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": "pong"}],
+                temperature=0.0,
+            )
+        resp = await asyncio.get_running_loop().run_in_executor(None, _call)
+        txt = (resp.choices[0].message.content or "").strip()
+        log.info("OpenAI probe OK: %s", txt[:120])
+    except Exception as e:
+        # Вытащим максимум деталей из исключения
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        body   = None
+        try:
+            body = getattr(e, "response", None) and e.response.json()
+        except Exception:
+            pass
+        log.error("OpenAI probe FAILED | status=%s | err=%s | body=%s", status, e, body)
+
+# ===================== FREE CHAT =====================
+def _looks_like_housing(text: str) -> bool:
+    t = text.lower()
+    keywords = ["снять", "аренда", "аренд", "вилла", "вилл", "дом", "квартира", "жильё", "жилье", "ренд"]
+    return any(k in t for k in keywords)
+
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Болталка. Всегда ведём к /rent и показываем ресурсы."""
     text = (update.message.text or "").strip()
 
-    # Если пользователь сам пишет "rent" — сразу в анкету
     if text.lower() == "rent":
         return await cmd_rent(update, context)
 
-    if OPENAI_API_KEY:
+    client = _get_openai_client()
+    if client:
+        import asyncio
         try:
-            from openai import OpenAI
-            client = OpenAI(
-                api_key=OPENAI_API_KEY,
-                project=OPENAI_PROJECT or None,
-                organization=OPENAI_ORG or None,
-                timeout=30,
-            )
             sys_prompt = (
-                "Ты ассистент Cozy Asia (Самуи). Всегда дружелюбен, краток и полезен. "
-                "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent. "
-                "Всегда давай наш аккуратный блок ресурсов отдельным абзацем в конце ответа:\n\n"
+                "Ты ассистент Cozy Asia (Самуи). Говоришь дружелюбно и по делу. "
+                "Если разговор касается аренды/покупки жилья — мягко предложи /rent. "
+                "В конце ответа всегда дай блок с ресурсами отдельным абзацем:\n\n"
                 + promo_block()
             )
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.6,
-            )
+
+            def _call():
+                return client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": text},
+                    ],
+                    temperature=0.6,
+                )
+
+            resp = await asyncio.get_running_loop().run_in_executor(None, _call)
             answer = (resp.choices[0].message.content or "").strip()
-            if "/rent" not in answer and any(
-                k in text.lower() for k in ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье"]
-            ):
+
+            if "/rent" not in answer and _looks_like_housing(text):
                 answer += "\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
+
             await update.message.reply_text(answer)
             return
         except Exception as e:
-            # Максимально подробный лог, чтобы в Render Logs было видно, что не так.
-            log.error("OpenAI chat error: %s", e)
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            body   = None
+            try:
+                body = getattr(e, "response", None) and e.response.json()
+            except Exception:
+                pass
+            log.error("OpenAI chat error | status=%s | err=%s | body=%s", status, e, body)
 
     # Фоллбэк без OpenAI
     fallback = "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n" + promo_block()
@@ -323,15 +371,10 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(rent_conv)
-    # ВАЖНО: болталка добавляется ПОСЛЕ rent_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
     return app
 
 def run_webhook(app: Application):
-    """
-    PTB 21.6: корректный запуск вебхука.
-    url_path должен совпадать с хвостом, который мы укажем Telegram при setWebhook.
-    """
     url_path = f"webhook/{TELEGRAM_TOKEN}"
     webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/{url_path}"
     log.info("==> start webhook on 0.0.0.0:%s | url=%s", PORT, webhook_url)
@@ -348,6 +391,9 @@ def run_webhook(app: Application):
 def main():
     _print_openai_cfg()
     app = build_application()
+    # Проба OpenAI сразу после старта — смотри Render Logs
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(_probe_openai())
     run_webhook(app)
 
 if __name__ == "__main__":
