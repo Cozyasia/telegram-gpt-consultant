@@ -229,47 +229,60 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Окей, отменил анкету. Можем просто пообщаться или запустить /rent позже.")
     return ConversationHandler.END
 
-# ===================== FREE CHAT =====================
+# ===================== FREE CHAT (асинхронный OpenAI + фоллбэк) =====================
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Болталка. Всегда ведём к /rent и показываем ресурсы."""
+    """
+    Болталка. Если есть OPENAI_API_KEY — спрашиваем модель асинхронно (не блокируем event-loop).
+    При любой ошибке/таймауте даём аккуратный фоллбэк и подталкиваем к /rent.
+    """
     text = (update.message.text or "").strip()
 
     # Если пользователь сам пишет "rent" — сразу в анкету
     if text.lower() == "rent":
         return await cmd_rent(update, context)
 
-    if OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            sys_prompt = (
-                "Ты ассистент Cozy Asia (Самуи). Всегда дружелюбен, краток и полезен. "
-                "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent. "
-                "Всегда давай наш аккуратный блок ресурсов отдельным абзацем в конце ответа:\n\n"
-                + promo_block()
-            )
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.6,
-            )
-            answer = resp.choices[0].message.content.strip()
-            if "/rent" not in answer and any(k in text.lower() for k in ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье"]):
-                answer += "\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
-            await update.message.reply_text(answer)
-            return
-        except Exception as e:
-            log.error("OpenAI error: %s", e)
-
-    # Фоллбэк без OpenAI
     fallback = (
-        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n"
-        + promo_block()
+        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n" + promo_block()
     )
-    await update.message.reply_text(fallback)
+
+    if not OPENAI_API_KEY:
+        await update.message.reply_text(fallback)
+        return
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=12.0)
+
+        sys_prompt = (
+            "Ты ассистент Cozy Asia (о. Самуи). Всегда дружелюбен и полезен. "
+            "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent. "
+            "В ответах периодически и красиво напоминай о наших ресурсах (каждый блок с эмодзи и новой строкой), "
+            "но не дублируй ресурсы слишком часто:\n"
+            "🌐 Сайт — https://cozy.asia\n"
+            "📣 Канал — https://t.me/cozy_asia\n"
+            "📘 Правила/FAQ — https://t.me/cozy_asia_rules"
+        )
+
+        resp = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.6,
+        )
+
+        answer = (resp.choices[0].message.content or "").strip()
+        if "/rent" not in answer.lower() and any(
+            k in text.lower() for k in ("снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье", "buy", "rent")
+        ):
+            answer += "\n\n👉 Чтобы оформить запрос на подбор — напишите /rent."
+
+        await update.message.reply_text(answer or fallback)
+
+    except Exception as e:
+        log.error("OpenAI (free_text) error: %s", e)
+        await update.message.reply_text(fallback)
 
 # ===================== BOOTSTRAP =====================
 def build_application() -> Application:
