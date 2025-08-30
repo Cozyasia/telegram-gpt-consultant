@@ -4,6 +4,7 @@ import json
 import time
 import logging
 from datetime import datetime
+from typing import List
 
 from telegram import Update
 from telegram.ext import (
@@ -53,14 +54,10 @@ def _log_openai_env():
         log.warning("OpenAI disabled: no OPENAI_API_KEY")
         return
     try:
-        import openai
-        ver = getattr(openai, "__version__", "unknown")
-        path = getattr(openai, "__file__", "unknown")
+        import openai  # noqa
         key_type = "project-key" if OPENAI_API_KEY.startswith("sk-proj-") else "user-key"
-        log.info(
-            "OpenAI ready | sdk=%s | from=%s | type=%s | model=%s | project=%s | org=%s",
-            ver, path, key_type, OPENAI_MODEL, (OPENAI_PROJECT or "—"), (OPENAI_ORG or "—")
-        )
+        log.info("OpenAI ready | type=%s | model=%s | project=%s | org=%s",
+                 key_type, OPENAI_MODEL, (OPENAI_PROJECT or "—"), (OPENAI_ORG or "—"))
         if OPENAI_API_KEY.startswith("sk-proj-") and not OPENAI_PROJECT:
             log.warning("You are using project-key but OPENAI_PROJECT is empty (proj_...).")
     except Exception as e:
@@ -91,23 +88,16 @@ _gspread = None
 _worksheet = None
 
 def _init_sheets_once():
-    """Подключаемся к Google Sheets один раз по требованию."""
+    """Ленивая инициализация Google Sheets (один раз)."""
     global _gspread, _worksheet
     if _worksheet is not None:
         return
-
     if not SHEET_ID or not GOOGLE_CREDS_RAW:
-        log.warning("Google Sheets disabled (no GOOGLE_SHEET_ID or GOOGLE_CREDS_JSON)")
+        log.warning("Google Sheets disabled (missing GOOGLE_SHEET_ID or GOOGLE_CREDS_JSON)")
         return
-
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-    except Exception as e:
-        log.error("gspread/google-auth not available: %s", e)
-        return
-
-    try:
         sa_info = json.loads(GOOGLE_CREDS_RAW)
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -119,14 +109,30 @@ def _init_sheets_once():
         try:
             _worksheet = sh.worksheet("Leads")
         except Exception:
-            _worksheet = sh.sheet1  # fallback если нет листа "Leads"
+            _worksheet = sh.sheet1
+        # ensure headers
+        headers = [
+            "created_at", "chat_id", "username",
+            "location", "bedrooms", "budget",
+            "checkin", "checkout", "type", "notes"
+        ]
+        vals = _worksheet.get_all_values()
+        if not vals:
+            _worksheet.append_row(headers, value_input_option="RAW")
+        else:
+            head = vals[0]
+            changed = False
+            for h in headers:
+                if h not in head:
+                    head.append(h); changed = True
+            if changed:
+                _worksheet.update('A1', [head], value_input_option="RAW")
         log.info("Google Sheets ready: %s", _worksheet.title)
     except Exception as e:
         log.error("Failed to init Google Sheets: %s", e)
         _worksheet = None
 
-def append_lead_row(row_values: list) -> bool:
-    """Добавить строку в таблицу (если настроено)."""
+def append_lead_row(row_values: List[str]) -> bool:
     _init_sheets_once()
     if _worksheet is None:
         return False
@@ -146,20 +152,15 @@ RESOURCES_HTML = (
     "📸 Instagram — <a href='https://www.instagram.com/cozy.asia'>@cozy.asia</a>\n"
     "👤 Чат с менеджером — <a href='https://t.me/cozy_asia'>@cozy_asia</a>"
 )
+
 SHOW_LINKS_INTERVAL = 12 * 3600  # 12 часов
 
 async def send_resources_ctx(message, context: ContextTypes.DEFAULT_TYPE, force: bool=False):
-    """Шлём блок ресурсов; не чаще 12 часов на пользователя (если force=False)."""
     now = time.time()
     last = context.user_data.get("links_last_ts", 0)
     if force or (now - last > SHOW_LINKS_INTERVAL):
         await message.reply_text(RESOURCES_HTML, parse_mode="HTML", disable_web_page_preview=True)
         context.user_data["links_last_ts"] = now
-
-LINK_KEYWORDS = (
-    "сайт","site","website","instagram","инстаграм","канал","телеграм",
-    "контакты","contact","support","links","ссылк","менеджер"
-)
 
 # ===================== ТЕКСТЫ =====================
 START_GREETING = (
@@ -182,11 +183,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_resources_ctx(update.effective_message, context, force=True)
-
-async def maybe_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").lower()
-    if any(k in text for k in LINK_KEYWORDS):
-        await send_resources_ctx(update.effective_message, context, force=False)
 
 async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -242,7 +238,7 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(summary)
 
-    # Уведомление в группу
+    # Уведомление в группу (если настроено)
     try:
         if GROUP_CHAT_ID:
             mention = (
@@ -272,14 +268,14 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id if update.effective_chat else ""
         username = update.effective_user.username if (update.effective_user and update.effective_user.username) else ""
         row = [
-            created, str(chat_id), username,            # created_at, chat_id, username
-            ud.get("district",""),                      # location
-            ud.get("bedrooms",""),                      # bedrooms
-            ud.get("budget",""),                        # budget
-            ud.get("checkin",""),                       # checkin
-            ud.get("checkout",""),                      # checkout
-            ud.get("type",""),                          # type
-            ud.get("notes",""),                         # notes
+            created, str(chat_id), username,           # created_at, chat_id, username
+            ud.get("district",""),                    # location
+            ud.get("bedrooms",""),                    # bedrooms
+            ud.get("budget",""),                      # budget
+            ud.get("checkin",""),                     # checkin
+            ud.get("checkout",""),                    # checkout
+            ud.get("type",""),                        # type
+            ud.get("notes",""),                       # notes
         ]
         ok = append_lead_row(row)
         if not ok:
@@ -298,9 +294,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Окей, отменил анкету. Можем просто пообщаться или запустить /rent позже.")
     return ConversationHandler.END
 
-# ===================== FREE CHAT =====================
+# ===================== FREE CHAT (GPT) =====================
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Свободное общение. Мягко ведём к /rent."""
+    """Свободное общение. Ничего не перехватываем, мягко ведём к /rent."""
     text = (update.message.text or "").strip()
 
     if text.lower() == "rent":
@@ -316,8 +312,8 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 timeout=30,
             )
             sys_prompt = (
-                "Ты ассистент Cozy Asia (Самуи). Всегда дружелюбен, краток и полезен. "
-                "Если разговор касается аренды/покупки жилья — мягко предлагаешь пройти анкету командой /rent."
+                "Ты ассистент Cozy Asia (Самуи). Дружелюбен, краток и полезен. "
+                "Отвечай на вопросы о Самуи/аренде/жизни. Если уместно — предложи пройти анкету /rent."
             )
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -329,7 +325,7 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             answer = (resp.choices[0].message.content or "").strip()
             if "/rent" not in answer and any(
-                k in text.lower() for k in ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье"]
+                k in text.lower() for k in ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье", "жилье"]
             ):
                 answer += "\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
             await update.message.reply_text(answer)
@@ -338,8 +334,9 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.error("OpenAI chat error: %s", e)
 
     # Фоллбэк без OpenAI
-    fallback = "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
-    await update.message.reply_text(fallback)
+    await update.message.reply_text(
+        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
+    )
 
 # ===================== BOOTSTRAP =====================
 def build_application() -> Application:
@@ -349,7 +346,7 @@ def build_application() -> Application:
         entry_points=[CommandHandler("rent", cmd_rent)],
         states={
             Q_TYPE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, q_type)],
-            Q_DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_district)],
+       	    Q_DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_district)],
             Q_BUDGET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, q_budget)],
             Q_BEDROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, q_bedrooms)],
             Q_CHECKIN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, q_checkin)],
@@ -365,9 +362,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("links", cmd_links))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Сначала "интуитивная" выдача ссылок по ключевым словам...
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_links))
-    # ...потом сам разговорный бот
+    # ВАЖНО: сначала ConversationHandler для /rent,
+    # затем ЕДИНСТВЕННЫЙ общий обработчик текста (GPT-чат).
     app.add_handler(rent_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
 
