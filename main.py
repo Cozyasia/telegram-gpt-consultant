@@ -4,7 +4,7 @@ import json
 import time
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Set
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -107,8 +107,10 @@ def _init_sheets_once():
         except Exception:
             _worksheet = sh.sheet1
 
+        # добавили колонку lots
         expected_headers = [
-            "created_at", "chat_id", "username", "name",
+            "created_at", "chat_id", "username",
+            "lots", "name",
             "location", "bedrooms", "budget",
             "checkin", "checkout", "type", "notes",
             "contact", "transfer"
@@ -147,11 +149,23 @@ RESOURCES_HTML = (
     "📣 Telegram — <a href='https://t.me/samuirental'>@samuirental</a>\n"
     "🏝️ Telegram — <a href='https://t.me/arenda_vill_samui'>@arenda_vill_samui</a>\n"
     "📸 Instagram — <a href='https://www.instagram.com/cozy.asia'>@cozy.asia</a>\n"
-    "👤 Чат с менеджером — <a href='https://t.me/cozy_asia'>@cozy_asia</a>"
+)
+
+RESOURCES_AFTER_SURVEY_HTML = (
+    "<b>📎 Наши ресурсы</b>\n\n"
+    "🌐 Web site — <a href='http://cozy-asiath.com/'>cozy-asiath.com</a>\n"
+    "📣 Telegram — <a href='https://t.me/samuirental'>@samuirental</a>\n"
+    "🏝️ Telegram — <a href='https://t.me/arenda_vill_samui'>@arenda_vill_samui</a>\n"
+    "📸 Instagram — <a href='https://www.instagram.com/cozy.asia'>@cozy.asia</a>\n\n"
+    "<b>Ваша заявка сформирована и передана менеджерам.</b>\n"
+    "Для оперативной связи переходите в чат с менеджером:\n"
+    "@cozy_asia — Сергей\n"
+    "@Aleksei_Lucky — Алексей"
 )
 SHOW_LINKS_INTERVAL = 12 * 3600  # 12 часов
 
 async def send_resources_ctx(message, context: ContextTypes.DEFAULT_TYPE, force: bool=False):
+    """Показывает общий блок ресурсов (без финального текста заявки)."""
     now = time.time()
     last = context.user_data.get("links_last_ts", 0)
     if force or (now - last > SHOW_LINKS_INTERVAL):
@@ -159,15 +173,19 @@ async def send_resources_ctx(message, context: ContextTypes.DEFAULT_TYPE, force:
         context.user_data["links_last_ts"] = now
 
 # ===================== ТЕКСТЫ =====================
+TOT_Q = 11
+def qn(n: int) -> str:
+    return f"{n}/{TOT_Q}"
+
 START_GREETING = (
     "✅ Я уже тут!\n"
     "🌴 Можете спросить меня о вашем пребывании на острове — подскажу и помогу.\n"
-    "👉 Или нажмите команду /rent — я задам несколько вопросов о жилье, сформирую заявку, предложу варианты и передам менеджеру."
+    "👉 Или нажмите команду /rent — задам несколько вопросов, сформирую заявку и передам менеджеру."
 )
 
 RENT_INTRO = (
-    "Запускаю короткую анкету. Вопрос 1/10:\n"
-    "как вас зовут? (имя и, если удобно, фамилия)\n\n"
+    f"Запускаю короткую анкету. Вопрос {qn(1)}:\n"
+    "какой именно лот вас заинтересовал? (напишите номер лота, если их несколько — через запятую)\n\n"
     "Если хотите просто поговорить — задайте вопрос, я отвечу 🙂"
 )
 
@@ -177,11 +195,16 @@ KB_TYPE = ReplyKeyboardMarkup(
     resize_keyboard=True, one_time_keyboard=True
 )
 
-KB_DISTRICT = ReplyKeyboardMarkup(
+DISTRICTS = ["Ламай", "Маенам", "Чавенг",
+             "Бопхут", "Чавенг Ной", "Банграк",
+             "Плай Лаем", "Липа Ной", "Натон"]
+
+KB_DISTRICT_MULTI = ReplyKeyboardMarkup(
     [["Ламай", "Маенам", "Чавенг"],
      ["Бопхут", "Чавенг Ной", "Банграк"],
-     ["Плай Лаем", "Липа Ной", "Натон"]],
-    resize_keyboard=True, one_time_keyboard=True
+     ["Плай Лаем", "Липа Ной", "Натон"],
+     ["Готово", "Сброс"]],
+    resize_keyboard=True, one_time_keyboard=False
 )
 
 KB_BEDROOMS = ReplyKeyboardMarkup(
@@ -195,7 +218,7 @@ KB_YESNO = ReplyKeyboardMarkup(
 )
 
 # ===================== STATE MACHINE /rent =====================
-(Q_NAME, Q_TYPE, Q_DISTRICT, Q_BUDGET, Q_BEDROOMS, Q_CHECKIN, Q_CHECKOUT, Q_NOTES, Q_CONTACTS, Q_TRANSFER) = range(10)
+(Q_LOT, Q_NAME, Q_TYPE, Q_DISTRICT, Q_BUDGET, Q_BEDROOMS, Q_CHECKIN, Q_CHECKOUT, Q_NOTES, Q_CONTACTS, Q_TRANSFER) = range(11)
 
 def _only_digits_or_original(text: str) -> str:
     text = (text or "").strip()
@@ -203,49 +226,132 @@ def _only_digits_or_original(text: str) -> str:
     return digits or text
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # deep-link: /start <payload>  (например, LOT123)
+    try:
+        if context.args:
+            payload_raw = " ".join(context.args).strip()
+            if payload_raw:
+                context.user_data["lot_hint"] = payload_raw
+                log.info("Captured start payload (lot_hint): %s", payload_raw)
+    except Exception as e:
+        log.warning("Failed to parse start args: %s", e)
     await update.effective_message.reply_text(START_GREETING)
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_resources_ctx(update.effective_message, context, force=True)
 
 async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # сохраняем возможную подсказку лота из /start
+    lot_hint = context.user_data.get("lot_hint")
     context.user_data.clear()
-    await update.effective_message.reply_text(RENT_INTRO)
+    if lot_hint:
+        context.user_data["lot_hint"] = lot_hint
+
+    hint_text = ""
+    if lot_hint:
+        hint_text = f"\n\nПодсказка: вижу, что вы пришли из лота <b>{lot_hint}</b> — подтвердите или исправьте."
+    await update.effective_message.reply_text(RENT_INTRO + hint_text, parse_mode="HTML")
+    return Q_LOT
+
+def _normalize_tokens(s: str) -> List[str]:
+    parts = [p.strip() for p in (s or "").replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
+async def q_lot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lots_text = (update.message.text or "").strip()
+    context.user_data["lots"] = lots_text
+    await update.message.reply_text(f"{qn(2)}: как вас зовут? (имя и, если удобно, фамилия)")
     return Q_NAME
 
 async def q_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = (update.message.text or "").strip()
-    await update.message.reply_text("2/10: тип жилья?", reply_markup=KB_TYPE)
+    await update.message.reply_text(f"{qn(3)}: тип жилья?", reply_markup=KB_TYPE)
     return Q_TYPE
 
 async def q_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["type"] = (update.message.text or "").strip()
-    await update.message.reply_text("3/10: район?", reply_markup=KB_DISTRICT)
+    context.user_data["districts_set"] = set()  # тип: Set[str]
+    await update.message.reply_text(
+        f"{qn(4)}: район? (можно несколько: нажимайте по очереди; «Готово» — далее; «Сброс» — начать заново)",
+        reply_markup=KB_DISTRICT_MULTI
+    )
     return Q_DISTRICT
 
 async def q_district(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["district"] = (update.message.text or "").strip()
-    await update.message.reply_text("4/10: бюджет на месяц (только число, например 50000)", reply_markup=ReplyKeyboardRemove())
+    text = (update.message.text or "").strip()
+    sel: Set[str] = context.user_data.get("districts_set", set())
+
+    # быстрый ввод "Ламай, Маенам"
+    if "," in text:
+        tokens = _normalize_tokens(text)
+        valid = [t for t in tokens if t in DISTRICTS]
+        if valid:
+            context.user_data["district"] = ", ".join(valid)
+        else:
+            context.user_data["district"] = text
+        # переход дальше
+        await update.message.reply_text(f"{qn(5)}: бюджет на месяц в батах (THB). Введите только число, например 50000",
+                                        reply_markup=ReplyKeyboardRemove())
+        return Q_BUDGET
+
+    if text == "Сброс":
+        sel.clear()
+        context.user_data["districts_set"] = sel
+        await update.message.reply_text("Выбор районов очищен. Выберите снова и нажмите «Готово».",
+                                        reply_markup=KB_DISTRICT_MULTI)
+        return Q_DISTRICT
+
+    if text == "Готово":
+        chosen = list(sel)
+        if not chosen:
+            await update.message.reply_text("Пока ничего не выбрано. Выберите один или несколько районов и нажмите «Готово».",
+                                            reply_markup=KB_DISTRICT_MULTI)
+            return Q_DISTRICT
+        context.user_data["district"] = ", ".join(chosen)
+        await update.message.reply_text(f"{qn(5)}: бюджет на месяц в батах (THB). Введите только число, например 50000",
+                                        reply_markup=ReplyKeyboardRemove())
+        return Q_BUDGET
+
+    # переключение выбора
+    if text in DISTRICTS:
+        if text in sel:
+            sel.remove(text)
+            action = "убрал"
+        else:
+            sel.add(text)
+            action = "добавил"
+        context.user_data["districts_set"] = sel
+        chosen = ", ".join(sorted(sel)) if sel else "пока ничего"
+        await update.message.reply_text(f"{action.title()} «{text}». Выбрано: {chosen}\n"
+                                        f"Когда закончите — нажмите «Готово».",
+                                        reply_markup=KB_DISTRICT_MULTI)
+        return Q_DISTRICT
+
+    # любое другое — принимаем как свободный ввод и идём дальше
+    context.user_data["district"] = text
+    await update.message.reply_text(f"{qn(5)}: бюджет на месяц в батах (THB). Введите только число, например 50000",
+                                    reply_markup=ReplyKeyboardRemove())
     return Q_BUDGET
 
 async def q_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["budget"] = _only_digits_or_original(update.message.text)
-    await update.message.reply_text("5/10: сколько спален нужно?", reply_markup=KB_BEDROOMS)
+    await update.message.reply_text(f"{qn(6)}: сколько спален нужно?", reply_markup=KB_BEDROOMS)
     return Q_BEDROOMS
 
 async def q_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["bedrooms"] = _only_digits_or_original(update.message.text)
-    await update.message.reply_text("6/10: дата заезда (любой формат: 2025-12-01, 01.12.2025 и т. п.)", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(f"{qn(7)}: дата заезда (любой формат: 2025-12-01, 01.12.2025 и т. п.)",
+                                    reply_markup=ReplyKeyboardRemove())
     return Q_CHECKIN
 
 async def q_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["checkin"] = (update.message.text or "").strip()
-    await update.message.reply_text("7/10: дата выезда (любой формат)")
+    await update.message.reply_text(f"{qn(8)}: дата выезда (любой формат)")
     return Q_CHECKOUT
 
 async def q_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["checkout"] = (update.message.text or "").strip()
-    await update.message.reply_text("8/10: важные условия/примечания (питомцы, бассейн, парковка и т.п.)")
+    await update.message.reply_text(f"{qn(9)}: важные условия/примечания (питомцы, бассейн, парковка и т.п.)")
     return Q_NOTES
 
 async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -253,16 +359,18 @@ async def q_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_user = update.effective_user
     suggested = ("@" + tg_user.username) if tg_user and tg_user.username else None
-    text = "9/10: ваши контактные данные (телефон, @username или e-mail)"
+    text = (f"{qn(10)}: ваши контактные данные (телефон, @username или e-mail)\n"
+            "Важно: Telegram скрывает ваш номер. "
+            "Пожалуйста, укажите WhatsApp и Telegram — номер телефона или @username для обратной связи.")
     if suggested:
-        text += f"\nПодсказка: у вас есть {suggested}. Можно отправить его."
+        text += f"\nПодсказка: у вас есть {suggested} — можно отправить его."
     await update.message.reply_text(text)
     return Q_CONTACTS
 
 async def q_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["contact"] = (update.message.text or "").strip()
     await update.message.reply_text(
-        "10/10: нужен ли вам трансфер? (Да/Нет). Если Да — напишите детали (аэропорт/время/кол-во людей/детское кресло).",
+        f"{qn(11)}: нужен ли вам трансфер? (Да/Нет). Если Да — напишите детали (аэропорт/время/кол-во людей/детское кресло).",
         reply_markup=KB_YESNO
     )
     return Q_TRANSFER
@@ -274,11 +382,12 @@ async def q_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = context.user_data
     summary = (
         "📝 Заявка сформирована и передана менеджеру.\n\n"
+        f"Лоты: {ud.get('lots','')}\n"
         f"Имя: {ud.get('name','')}\n"
         f"Тип: {ud.get('type','')}\n"
-        f"Район: {ud.get('district','')}\n"
+        f"Район(ы): {ud.get('district','')}\n"
         f"Спален: {ud.get('bedrooms','')}\n"
-        f"Бюджет: {ud.get('budget','')}\n"
+        f"Бюджет (THB): {ud.get('budget','')}\n"
         f"Check-in: {ud.get('checkin','')}\n"
         f"Check-out: {ud.get('checkout','')}\n"
         f"Условия: {ud.get('notes','')}\n"
@@ -299,9 +408,10 @@ async def q_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_text = (
                 "🆕 Новая заявка Cozy Asia\n"
                 f"Клиент: {ud.get('name','')} | TG: {mention}\n"
+                f"Лоты: {ud.get('lots','')}\n"
                 f"Тип: {ud.get('type','')}\n"
-                f"Район: {ud.get('district','')}\n"
-                f"Бюджет: {ud.get('budget','')}\n"
+                f"Район(ы): {ud.get('district','')}\n"
+                f"Бюджет (THB): {ud.get('budget','')}\n"
                 f"Спален: {ud.get('bedrooms','')}\n"
                 f"Check-in: {ud.get('checkin','')} | Check-out: {ud.get('checkout','')}\n"
                 f"Условия/прим.: {ud.get('notes','')}\n"
@@ -320,6 +430,7 @@ async def q_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username = update.effective_user.username if (update.effective_user and update.effective_user.username) else ""
         row = [
             created, str(chat_id), username,
+            ud.get("lots",""),
             ud.get("name",""),
             ud.get("district",""),
             ud.get("bedrooms",""),
@@ -337,7 +448,9 @@ async def q_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error("Sheet append error: %s", e)
 
-    await send_resources_ctx(update.message, context, force=True)
+    # Спец-блок после анкеты (с контактами менеджеров)
+    await update.message.reply_text(RESOURCES_AFTER_SURVEY_HTML, parse_mode="HTML", disable_web_page_preview=True)
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -377,14 +490,14 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "/rent" not in answer and any(
                 k in text.lower() for k in ["снять", "аренда", "вилла", "дом", "квартира", "жильё", "жилье"]
             ):
-                answer += "\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
+                answer += "\n\n👉 Чтобы оформить запрос на подбор — напишите /rent."
             await update.message.reply_text(answer)
             return
         except Exception as e:
             log.error("OpenAI chat error: %s", e)
 
     await update.message.reply_text(
-        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n👉 Чтобы оформить запрос на подбор — напиши /rent."
+        "Могу помочь с жильём, жизнью на Самуи, районами и т.д.\n\n👉 Чтобы оформить запрос на подбор — напишите /rent."
     )
 
 # ===================== BOOTSTRAP =====================
@@ -394,6 +507,7 @@ def build_application() -> Application:
     rent_conv = ConversationHandler(
         entry_points=[CommandHandler("rent", cmd_rent)],
         states={
+            Q_LOT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, q_lot)],
             Q_NAME:      [MessageHandler(filters.TEXT & ~filters.COMMAND, q_name)],
             Q_TYPE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, q_type)],
             Q_DISTRICT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, q_district)],
