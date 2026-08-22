@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Production entrypoint: legacy Telegram GPT consultant + independent property catalog."""
+"""Production entrypoint: legacy Telegram GPT consultant + searchable property catalog."""
+import asyncio
 import json
 import logging
 import os
@@ -11,31 +12,38 @@ import legacy_main as legacy
 import cozy_catalog
 
 log = logging.getLogger("consultant-wrapper")
+_original_free_text = legacy.free_text
 
 
 def _log_google_service_account():
     raw = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
     if not raw:
-        log.warning("Google service account email unavailable: GOOGLE_CREDS_JSON is empty")
         return
     try:
-        info = json.loads(raw)
-        email = (info.get("client_email") or "").strip()
+        email = (json.loads(raw).get("client_email") or "").strip()
         if email:
-            log.info("Google service account email: %s", email)
-        else:
-            log.warning("Google service account email missing in JSON")
+            log.info("Google service account: %s", email)
     except Exception:
-        log.exception("Could not parse GOOGLE_CREDS_JSON for client_email")
+        log.warning("Could not parse GOOGLE_CREDS_JSON client_email")
+
+
+async def catalog_aware_free_text(update, context):
+    text = (getattr(update.effective_message, "text", None) or "").strip()
+    if text:
+        try:
+            answer = await asyncio.to_thread(cozy_catalog.answer_catalog_query, text)
+            if answer:
+                await update.effective_message.reply_text(answer, disable_web_page_preview=True)
+                return
+        except Exception:
+            log.exception("Catalog search failed; falling back to GPT chat")
+    return await _original_free_text(update, context)
 
 
 def _bootstrap_catalog():
     try:
-        cozy_catalog.ensure_lots_sheet()
-        log.info("Lots worksheet ready")
-        if cozy_catalog.CATALOG_BOOTSTRAP_IMPORT:
-            stats = cozy_catalog.import_public_channel_latest(cozy_catalog.CATALOG_BOOTSTRAP_LIMIT, False)
-            log.info("Bootstrap catalog import: %s", stats)
+        stats = cozy_catalog.bootstrap_catalog()
+        log.info("Catalog bootstrap: %s", stats)
     except Exception:
         log.exception("Catalog bootstrap failed")
 
@@ -43,6 +51,8 @@ def _bootstrap_catalog():
 def _install_catalog_handlers(app):
     app.add_handler(CommandHandler("catalog_import", cozy_catalog.cmd_catalog_import), group=-20)
     app.add_handler(CommandHandler("catalog_status", cozy_catalog.cmd_catalog_status), group=-20)
+    app.add_handler(CommandHandler("find", cozy_catalog.cmd_find), group=-20)
+    app.add_handler(CommandHandler("lot", cozy_catalog.cmd_lot), group=-20)
     app.add_handler(MessageHandler(filters.ALL, cozy_catalog.catch_catalog_updates), group=-10)
     log.info("Catalog handlers installed for @%s", cozy_catalog.CATALOG_CHANNEL)
 
@@ -51,6 +61,7 @@ def main():
     legacy._log_openai_env()
     legacy._probe_openai()
     _log_google_service_account()
+    legacy.free_text = catalog_aware_free_text
     app = legacy.build_application()
     _install_catalog_handlers(app)
     threading.Thread(target=_bootstrap_catalog, name="catalog-bootstrap", daemon=True).start()
