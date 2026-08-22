@@ -10,6 +10,9 @@ from telegram.ext import CommandHandler, MessageHandler, filters
 
 import legacy_main as legacy
 import cozy_catalog
+import catalog_fixes
+
+catalog_fixes.apply(cozy_catalog)
 
 log = logging.getLogger("consultant-wrapper")
 _original_free_text = legacy.free_text
