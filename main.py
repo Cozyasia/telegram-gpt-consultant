@@ -20,16 +20,15 @@ import cozy_catalog
 import catalog_fixes
 import catalog_search_patch
 import catalog_dialog
+import post_standardizer
 
 catalog_fixes.apply(cozy_catalog)
 catalog_search_patch.apply(cozy_catalog)
-# Search the complete active catalog. Recency affects ranking, but no longer hides older lots.
 cozy_catalog.search_catalog = lambda spec, limit=5: catalog_dialog.smart_search(cozy_catalog, spec, limit)
 
 log = logging.getLogger("consultant-wrapper")
 _original_free_text = legacy.free_text
 
-# Public copy used for a normal /start or a search deep-link.
 legacy.START_GREETING = (
     "👋 Добро пожаловать в Cozy Asia!\n\n"
     "🏡 Можете сразу написать, какое жильё ищете — я подберу варианты из нашего каталога и дам ссылки на лоты.\n"
@@ -130,18 +129,11 @@ async def catalog_voice(update, context):
 
 
 async def smart_start(update, context):
-    """Deep links:
-    ?start=rent          -> immediately start the manager application form
-    ?start=rent_1181     -> same, with lot 1181 prefilled as a hint
-    ?start=search        -> open catalog assistant mode
-    plain /start         -> normal welcome message
-    """
     payload = "_".join(context.args or []).strip()
     low = payload.lower()
 
     if low == "rent" or low.startswith("rent_"):
         lot = payload[5:].strip() if low.startswith("rent_") else ""
-        # Keep only a safe lot representation, including variants such as 1020-1 / 01-1132.
         if lot and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", lot):
             context.user_data["lot_hint"] = lot
             log.info("Deep-link application for lot=%s", lot)
@@ -151,13 +143,11 @@ async def smart_start(update, context):
         return await legacy.cmd_rent(update, context)
 
     if low == "search":
-        # Reset only catalog paging so a new deep link starts a fresh selection.
         for key in ("catalog_spec", "catalog_rows", "catalog_offset", "catalog_ts"):
             context.user_data.pop(key, None)
         await update.effective_message.reply_text(SEARCH_GREETING)
         return ConversationHandler.END
 
-    # Backward compatibility: old LOT_1176 / 1176 links remain recognized as a lot hint.
     if payload:
         lot_match = re.fullmatch(r"(?i)(?:lot[_-]?)?([0-9]+(?:-[0-9]+)?)", payload)
         if lot_match:
@@ -175,6 +165,15 @@ def _bootstrap_catalog():
         catalog_dialog.selftest(cozy_catalog)
     except Exception:
         log.exception("Catalog bootstrap failed")
+
+
+def _standardize_existing():
+    try:
+        stats = post_standardizer.maybe_start_existing(cozy_catalog)
+        if stats:
+            log.info("Existing post standardization complete: %s", stats)
+    except Exception:
+        log.exception("Existing post standardization failed")
 
 
 def _build_application():
@@ -214,6 +213,7 @@ def _build_application():
     app.add_handler(CommandHandler("cancel", legacy.cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catalog_aware_free_text))
 
+    post_standardizer.install(app, cozy_catalog)
     log.info("Catalog handlers installed for @%s", cozy_catalog.CATALOG_CHANNEL)
     return app
 
@@ -224,6 +224,7 @@ def main():
     _log_google_service_account()
     app = _build_application()
     threading.Thread(target=_bootstrap_catalog, name="catalog-bootstrap", daemon=True).start()
+    threading.Thread(target=_standardize_existing, name="post-standardizer", daemon=True).start()
     legacy.run_webhook(app)
 
 
