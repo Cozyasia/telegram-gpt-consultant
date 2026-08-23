@@ -21,10 +21,12 @@ import catalog_fixes
 import catalog_search_patch
 import catalog_dialog
 import post_standardizer
+import post_template_patch
 
 catalog_fixes.apply(cozy_catalog)
 catalog_search_patch.apply(cozy_catalog)
 cozy_catalog.search_catalog = lambda spec, limit=5: catalog_dialog.smart_search(cozy_catalog, spec, limit)
+post_template_patch.apply(post_standardizer)
 
 log = logging.getLogger("consultant-wrapper")
 _original_free_text = legacy.free_text
