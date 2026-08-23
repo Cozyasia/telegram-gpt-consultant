@@ -19,6 +19,15 @@ catalog_search_patch.apply(cozy_catalog)
 # Search the complete active catalog. Recency affects ranking, but no longer hides older lots.
 cozy_catalog.search_catalog = lambda spec, limit=5: catalog_dialog.smart_search(cozy_catalog, spec, limit)
 
+# Clear start message: users may either search the live catalog in free text or fill in /rent.
+legacy.START_GREETING = (
+    "👋 Добро пожаловать в Cozy Asia!\n\n"
+    "🏡 Можете сразу написать, какое жильё ищете — я подберу варианты из нашего каталога и дам ссылки на лоты.\n"
+    "Например: «Дом или вилла, Ламай / Маенам / Чавенг, 2 спальни, бассейн, до 80 000 бат».\n\n"
+    "📝 Если хотите оставить подробную заявку менеджеру — нажмите /rent и ответьте на несколько вопросов.\n\n"
+    "Также можете просто задавать мне вопросы о Самуи, районах, аренде и жизни на острове."
+)
+
 log = logging.getLogger("consultant-wrapper")
 _original_free_text = legacy.free_text
 
