@@ -4,9 +4,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 
-from telegram.ext import CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 import legacy_main as legacy
 import cozy_catalog
@@ -19,17 +26,24 @@ catalog_search_patch.apply(cozy_catalog)
 # Search the complete active catalog. Recency affects ranking, but no longer hides older lots.
 cozy_catalog.search_catalog = lambda spec, limit=5: catalog_dialog.smart_search(cozy_catalog, spec, limit)
 
-# Clear start message: users may either search the live catalog in free text or fill in /rent.
+log = logging.getLogger("consultant-wrapper")
+_original_free_text = legacy.free_text
+
+# Public copy used for a normal /start or a search deep-link.
 legacy.START_GREETING = (
     "👋 Добро пожаловать в Cozy Asia!\n\n"
     "🏡 Можете сразу написать, какое жильё ищете — я подберу варианты из нашего каталога и дам ссылки на лоты.\n"
     "Например: «Дом или вилла, Ламай / Маенам / Чавенг, 2 спальни, бассейн, до 80 000 бат».\n\n"
-    "📝 Если хотите оставить подробную заявку менеджеру — нажмите /rent и ответьте на несколько вопросов.\n\n"
-    "Также можете просто задавать мне вопросы о Самуи, районах, аренде и жизни на острове."
+    "📝 Если хотите оставить подробную заявку менеджеру — нажмите /rent.\n"
+    "🌴 Также можете просто задавать вопросы о Самуи, районах и аренде."
 )
 
-log = logging.getLogger("consultant-wrapper")
-_original_free_text = legacy.free_text
+SEARCH_GREETING = (
+    "🏡 Подберу варианты из каталога Cozy Asia.\n\n"
+    "Напишите одним сообщением, что ищете. Например:\n"
+    "«Вилла или дом, Ламай / Маенам, 2 спальни, бассейн, до 80 000 бат».\n\n"
+    "Можно писать обычным текстом или отправить голосовое сообщение."
+)
 
 
 def _log_google_service_account():
@@ -115,6 +129,45 @@ async def catalog_voice(update, context):
     )
 
 
+async def smart_start(update, context):
+    """Deep links:
+    ?start=rent          -> immediately start the manager application form
+    ?start=rent_1181     -> same, with lot 1181 prefilled as a hint
+    ?start=search        -> open catalog assistant mode
+    plain /start         -> normal welcome message
+    """
+    payload = "_".join(context.args or []).strip()
+    low = payload.lower()
+
+    if low == "rent" or low.startswith("rent_"):
+        lot = payload[5:].strip() if low.startswith("rent_") else ""
+        # Keep only a safe lot representation, including variants such as 1020-1 / 01-1132.
+        if lot and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", lot):
+            context.user_data["lot_hint"] = lot
+            log.info("Deep-link application for lot=%s", lot)
+        else:
+            context.user_data.pop("lot_hint", None)
+            log.info("Deep-link generic application")
+        return await legacy.cmd_rent(update, context)
+
+    if low == "search":
+        # Reset only catalog paging so a new deep link starts a fresh selection.
+        for key in ("catalog_spec", "catalog_rows", "catalog_offset", "catalog_ts"):
+            context.user_data.pop(key, None)
+        await update.effective_message.reply_text(SEARCH_GREETING)
+        return ConversationHandler.END
+
+    # Backward compatibility: old LOT_1176 / 1176 links remain recognized as a lot hint.
+    if payload:
+        lot_match = re.fullmatch(r"(?i)(?:lot[_-]?)?([0-9]+(?:-[0-9]+)?)", payload)
+        if lot_match:
+            context.user_data["lot_hint"] = lot_match.group(1)
+            log.info("Captured legacy start lot_hint=%s", lot_match.group(1))
+
+    await update.effective_message.reply_text(legacy.START_GREETING)
+    return ConversationHandler.END
+
+
 def _bootstrap_catalog():
     try:
         stats = cozy_catalog.bootstrap_catalog()
@@ -124,24 +177,52 @@ def _bootstrap_catalog():
         log.exception("Catalog bootstrap failed")
 
 
-def _install_catalog_handlers(app):
+def _build_application():
+    app = ApplicationBuilder().token(legacy.TELEGRAM_TOKEN).build()
+
+    rent_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", smart_start),
+            CommandHandler("rent", legacy.cmd_rent),
+        ],
+        states={
+            legacy.Q_LOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_lot)],
+            legacy.Q_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_name)],
+            legacy.Q_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_type)],
+            legacy.Q_DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_district)],
+            legacy.Q_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_budget)],
+            legacy.Q_BEDROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_bedrooms)],
+            legacy.Q_CHECKIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_checkin)],
+            legacy.Q_CHECKOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_checkout)],
+            legacy.Q_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_notes)],
+            legacy.Q_CONTACTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_contacts)],
+            legacy.Q_TRANSFER: [MessageHandler(filters.TEXT & ~filters.COMMAND, legacy.q_transfer)],
+        },
+        fallbacks=[CommandHandler("cancel", legacy.cmd_cancel)],
+        allow_reentry=True,
+    )
+
     app.add_handler(CommandHandler("catalog_import", cozy_catalog.cmd_catalog_import), group=-20)
     app.add_handler(CommandHandler("catalog_status", cozy_catalog.cmd_catalog_status), group=-20)
     app.add_handler(CommandHandler("find", cozy_catalog.cmd_find), group=-20)
     app.add_handler(CommandHandler("lot", cozy_catalog.cmd_lot), group=-20)
     app.add_handler(MessageHandler(filters.ALL, cozy_catalog.catch_catalog_updates), group=-10)
-    # Voice/audio is transcribed and routed through the same stateful dialog as typed text.
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, catalog_voice), group=-5)
+
+    app.add_handler(rent_conv)
+    app.add_handler(CommandHandler("links", legacy.cmd_links))
+    app.add_handler(CommandHandler("cancel", legacy.cmd_cancel))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catalog_aware_free_text))
+
     log.info("Catalog handlers installed for @%s", cozy_catalog.CATALOG_CHANNEL)
+    return app
 
 
 def main():
     legacy._log_openai_env()
     legacy._probe_openai()
     _log_google_service_account()
-    legacy.free_text = catalog_aware_free_text
-    app = legacy.build_application()
-    _install_catalog_handlers(app)
+    app = _build_application()
     threading.Thread(target=_bootstrap_catalog, name="catalog-bootstrap", daemon=True).start()
     legacy.run_webhook(app)
 
