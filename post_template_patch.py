@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Richer standardized listing template: preserve factual amenities and hashtags."""
+"""Richer standardized listing template and faster safe historical pass."""
 import html
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 FEATURE_RE = re.compile(
     r"wifi|wi-fi|интернет|кухн|парков|стирал|кондиционер|сад|террас|уборк|бель|полотен|"
@@ -19,19 +21,15 @@ SKIP_RE = re.compile(
 
 
 def _features(source, limit=280):
-    out = []
-    seen = set()
+    out, seen = [], set()
     for raw in (source or "").splitlines():
         line = re.sub(r"\s+", " ", raw).strip(" •·—-\t")
-        if len(line) < 4 or line.startswith("#") or SKIP_RE.search(line):
-            continue
-        if not FEATURE_RE.search(line):
+        if len(line) < 4 or line.startswith("#") or SKIP_RE.search(line) or not FEATURE_RE.search(line):
             continue
         key = line.lower()
         if key in seen:
             continue
-        seen.add(key)
-        out.append(line)
+        seen.add(key); out.append(line)
         if len(out) >= 5:
             break
     text = " · ".join(out)
@@ -39,8 +37,7 @@ def _features(source, limit=280):
 
 
 def _hashtags(source):
-    tags = []
-    seen = set()
+    tags, seen = [], set()
     for tag in re.findall(r"(?<!\w)#[\w_]+", source or "", flags=re.UNICODE):
         low = tag.lower()
         if low not in seen:
@@ -48,6 +45,50 @@ def _hashtags(source):
         if len(tags) >= 8:
             break
     return " ".join(tags)
+
+
+def _crawl_payloads(mod, channel, target_ids, max_pages=450):
+    target = {str(x) for x in target_ids if str(x)}
+    links_by_mid, texts_by_mid = {}, {}
+    before = ""
+    for page_no in range(1, max_pages + 1):
+        url = f"https://t.me/s/{channel}" + (f"?before={before}" if before else "")
+        r = mod.requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        soup = mod.BeautifulSoup(r.text, "html.parser")
+        mids = []
+        for msg in soup.select(".tgme_widget_message"):
+            dp = (msg.get("data-post") or "").strip()
+            if "/" not in dp:
+                continue
+            ch, mid = dp.rsplit("/", 1)
+            if ch.lower() != channel.lower() or not mid.isdigit():
+                continue
+            mids.append(int(mid))
+            if mid not in target:
+                continue
+            node = msg.select_one(".tgme_widget_message_text")
+            if node:
+                texts_by_mid[mid] = mod.html.unescape(node.get_text("\n", strip=True)).strip()
+                links = []
+                for a in node.select("a[href]"):
+                    href = (a.get("href") or "").strip()
+                    if href:
+                        links.append((href, a.get_text(" ", strip=True)))
+                links_by_mid[mid] = links
+            else:
+                texts_by_mid[mid] = ""
+                links_by_mid[mid] = []
+        if target.issubset(texts_by_mid.keys()) or not mids:
+            break
+        oldest = min(mids)
+        if oldest <= 1 or str(oldest) == before:
+            break
+        before = str(oldest)
+        if page_no % 20 == 0:
+            mod.log.info("payload crawl @%s page=%s found=%s/%s", channel, page_no, len(texts_by_mid), len(target))
+        time.sleep(.05)
+    return links_by_mid, texts_by_mid
 
 
 def apply(mod):
@@ -100,15 +141,46 @@ def apply(mod):
         text = compose(desc, details, tags)
         plain = re.sub(r"<[^>]+>", "", text)
         if len(plain) > 990 and details:
-            details = details[:140].rstrip() + "…"
-            text = compose(desc, details, tags)
-            plain = re.sub(r"<[^>]+>", "", text)
+            details = details[:140].rstrip() + "…"; text = compose(desc, details, tags); plain = re.sub(r"<[^>]+>", "", text)
         if len(plain) > 990:
-            desc = desc[:130].rstrip() + "…"
-            text = compose(desc, details, tags)
-            plain = re.sub(r"<[^>]+>", "", text)
+            desc = desc[:130].rstrip() + "…"; text = compose(desc, details, tags); plain = re.sub(r"<[^>]+>", "", text)
         if len(plain) > 990:
             text = compose(desc, details, "")
         return text
 
+    def standardize_existing(catalog):
+        token, username, can_edit, status = mod.bot_identity_and_rights(catalog.CATALOG_CHANNEL)
+        mod.log.info("standardizer preflight @%s bot=@%s status=%s can_edit=%s", catalog.CATALOG_CHANNEL, username, status, can_edit)
+        if not can_edit:
+            raise RuntimeError(f"@{username} has no can_edit_messages in @{catalog.CATALOG_CHANNEL}")
+        rows = [r for r in catalog.load_catalog_rows(True) if str(r.get("lot_id") or "").strip() and str(r.get("telegram_message_id") or "").strip()]
+        by_mid = {str(r["telegram_message_id"]): r for r in rows}
+        rows = list(by_mid.values()); mids = list(by_mid)
+        links_by_mid, texts_by_mid = _crawl_payloads(mod, catalog.CATALOG_CHANNEL, mids, catalog.MAX_PAGES)
+        mod._backup_rows(catalog, rows, links_by_mid, texts_by_mid)
+        stats = {"channel": catalog.CATALOG_CHANNEL, "total": len(rows), "edited": 0, "unchanged": 0, "failed": 0}
+
+        def job(row):
+            mid = str(row["telegram_message_id"])
+            new_html = build_post(row, username, links_by_mid.get(mid, []))
+            result, err = mod._edit_one(token, catalog.CATALOG_CHANNEL, mid, new_html)
+            return row, result, err
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futures = [ex.submit(job, row) for row in sorted(rows, key=lambda x: int(x.get("telegram_message_id") or 0))]
+            for f in as_completed(futures):
+                row, result, err = f.result(); done += 1
+                if result.startswith("edited"):
+                    stats["edited"] += 1
+                elif result == "unchanged":
+                    stats["unchanged"] += 1
+                else:
+                    stats["failed"] += 1
+                    mod.log.warning("standardize failed @%s mid=%s lot=%s error=%s", catalog.CATALOG_CHANNEL, row.get("telegram_message_id"), row.get("lot_id"), (err or "")[:220])
+                if done % 10 == 0 or done == len(rows):
+                    mod.log.info("standardize @%s %s/%s edited=%s unchanged=%s failed=%s", catalog.CATALOG_CHANNEL, done, len(rows), stats["edited"], stats["unchanged"], stats["failed"])
+        return stats
+
     mod.build_post = build_post
+    mod.standardize_existing = standardize_existing
