@@ -23,12 +23,17 @@ import catalog_dialog
 import post_standardizer
 import post_template_patch
 import post_throttle_patch
+import post_layout_v7_safe
+import manual_edit_guard
+import mtproto_premium
 
 catalog_fixes.apply(cozy_catalog)
 catalog_search_patch.apply(cozy_catalog)
 cozy_catalog.search_catalog = lambda spec, limit=5: catalog_dialog.smart_search(cozy_catalog, spec, limit)
 post_template_patch.apply(post_standardizer)
 post_throttle_patch.apply(post_standardizer)
+post_layout_v7_safe.apply(post_standardizer, post_throttle_patch)
+manual_edit_guard.apply(post_standardizer)
 
 log = logging.getLogger("consultant-wrapper")
 _original_free_text = legacy.free_text
@@ -205,6 +210,7 @@ def _build_application():
         allow_reentry=True,
     )
 
+    mtproto_premium.install(app, cozy_catalog)
     app.add_handler(CommandHandler("catalog_import", cozy_catalog.cmd_catalog_import), group=-20)
     app.add_handler(CommandHandler("catalog_status", cozy_catalog.cmd_catalog_status), group=-20)
     app.add_handler(CommandHandler("find", cozy_catalog.cmd_find), group=-20)
