@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+import time
 
 from telegram.ext import (
     ApplicationBuilder,
@@ -26,6 +27,7 @@ import post_throttle_patch
 import post_layout_v7_safe
 import manual_edit_guard
 import mtproto_premium
+import fix_big_channel_ctas
 
 catalog_fixes.apply(cozy_catalog)
 catalog_search_patch.apply(cozy_catalog)
@@ -185,6 +187,16 @@ def _standardize_existing():
         log.exception("Existing post standardization failed")
 
 
+def _fix_big_channel_ctas_on_startup():
+    time.sleep(8)
+    try:
+        result = asyncio.run(fix_big_channel_ctas.run())
+        if result.get("enabled"):
+            log.info("Targeted big-channel CTA repair complete: %s", result)
+    except Exception:
+        log.exception("Targeted big-channel CTA repair failed")
+
+
 def _build_application():
     app = ApplicationBuilder().token(legacy.TELEGRAM_TOKEN).build()
 
@@ -235,6 +247,8 @@ def main():
     app = _build_application()
     threading.Thread(target=_bootstrap_catalog, name="catalog-bootstrap", daemon=True).start()
     threading.Thread(target=_standardize_existing, name="post-standardizer", daemon=True).start()
+    if fix_big_channel_ctas.enabled():
+        threading.Thread(target=_fix_big_channel_ctas_on_startup, name="fix-big-channel-ctas", daemon=True).start()
     legacy.run_webhook(app)
 
 
