@@ -90,6 +90,33 @@ def extract_lot_id(text):
         if g:return g[-1].lstrip("0") or "0"
     return ""
 
+def _valid_lot_id(value):
+    s=str(value or "").strip()
+    if not re.fullmatch(r"\d{3,7}",s):
+        return False
+    n=int(s)
+    return not (2000 <= n <= 2099)
+
+def _lot_from_message_entities(msg):
+    """Decode Premium lot digits from Telegram custom_emoji IDs, not fallback text."""
+    try:
+        import mtproto_premium
+        inverse={str(v):str(k) for k,v in mtproto_premium.DIGIT_IDS.items() if str(k).isdigit()}
+    except Exception:
+        return ""
+    parts=[]
+    entities=(getattr(msg,"caption_entities",None) or getattr(msg,"entities",None) or [])
+    for ent in entities:
+        typ=str(getattr(ent,"type","") or "").lower()
+        if "custom_emoji" not in typ:
+            continue
+        cid=str(getattr(ent,"custom_emoji_id","") or "")
+        digit=inverse.get(cid)
+        if digit is not None:
+            parts.append(digit)
+    candidate="".join(parts)
+    return candidate if _valid_lot_id(candidate) else ""
+
 def norm_district(v):
     s=_blank(v)
     if not s:return ""
@@ -193,7 +220,10 @@ def _record(p,old=None):
     d={h:"" for h in HEADERS}; d.update(_extract(p["text"])); d.update({"telegram_message_id":p["message_id"],"telegram_url":p["telegram_url"],"published_at":p["published_at"],"status":"active","исходный_текст":p["text"],"extracted_at":_now()})
     if old and _blank(old.get("контакт_собственника")):d["контакт_собственника"]=old["контакт_собственника"]
     if old and _blank(old.get("status")):d["status"]=norm_status(old["status"])
-    return canonical(d,p["text"])
+    rec=canonical(d,p["text"])
+    if old and _valid_lot_id(old.get("lot_id")) and not _valid_lot_id(rec.get("lot_id")):
+        rec["lot_id"]=str(old.get("lot_id")).strip()
+    return rec
 def normalize_existing_rows():
     with _lock:
         ws=ensure_lots_sheet(); vals=ws.get_all_values()
@@ -447,14 +477,21 @@ async def catch_catalog_updates(update,context):
     chat=getattr(msg,"chat",None); username=(getattr(chat,"username","") or "").lstrip("@")
     if username.lower()!=CATALOG_CHANNEL.lower():return
     text=(getattr(msg,"text",None) or getattr(msg,"caption",None) or "").strip()
-    if not text or not _is_listing(text,extract_lot_id(text)):return
+    entity_lot=_lot_from_message_entities(msg)
+    parsed_lot=entity_lot or extract_lot_id(text)
+    if not text or not _is_listing(text,parsed_lot):return
     pub=""
     if getattr(msg,"date",None):
         try:pub=msg.date.astimezone(timezone.utc).isoformat(timespec="seconds")
         except:pub=str(msg.date)
     p={"message_id":str(msg.message_id),"text":text,"published_at":pub,"telegram_url":f"https://t.me/{CATALOG_CHANNEL}/{msg.message_id}"}
     try:
-        ws=ensure_lots_sheet(); ex,h=_existing(ws); cur=ex.get(p["message_id"]); rec=await asyncio.to_thread(_record,p,cur[1] if cur else None); row=[rec.get(x,"") for x in h]
+        ws=ensure_lots_sheet(); ex,h=_existing(ws); cur=ex.get(p["message_id"]); rec=await asyncio.to_thread(_record,p,cur[1] if cur else None)
+        if entity_lot:
+            rec["lot_id"]=entity_lot
+        elif cur and _valid_lot_id(cur[1].get("lot_id")) and not _valid_lot_id(rec.get("lot_id")):
+            rec["lot_id"]=str(cur[1].get("lot_id")).strip()
+        row=[rec.get(x,"") for x in h]
         with _lock:
             if cur:ws.update(f"A{cur[0]}:{_col(len(h))}{cur[0]}",[row],value_input_option="USER_ENTERED")
             else:ws.append_row(row,value_input_option="USER_ENTERED")
