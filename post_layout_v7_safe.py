@@ -68,6 +68,8 @@ def apply(mod, throttle):
                 lines.append(f'<a href="{html.escape(href, quote=True)}">{mod._esc(title)}</a>')
             lines += [
                 "",
+                "Оператор: @cozy_asia",
+                "",
                 "📝 <b>ОСТАВИТЬ ЗАЯВКУ</b>",
                 f'👉 <a href="{html.escape(rent, quote=True)}"><b>ЖМИ ЗДЕСЬ</b></a> 👈',
                 "",
