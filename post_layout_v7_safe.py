@@ -22,6 +22,8 @@ def apply(mod, throttle):
 
     def build_post(row, bot_username, links=None):
         lot = mod._shown(row.get("lot_id"), "—", 30)
+        if not re.fullmatch(r"\d{3,7}", lot) or (2000 <= int(lot) <= 2099):
+            raise RuntimeError(f"Refusing to standardize listing with invalid lot_id={lot!r}")
         district = mod._shown(row.get("район"))
         typ = mod._shown(row.get("тип"))
         bedrooms = mod._shown(row.get("спальни"), "Не указано", 30)
@@ -64,8 +66,6 @@ def apply(mod, throttle):
                 lines += ["", f"✨ Дополнительно: {mod._esc(details_text)}"]
             for title, href in mod._external_links(links, bot)[:2]:
                 lines.append(f'<a href="{html.escape(href, quote=True)}">{mod._esc(title)}</a>')
-            if tags_text:
-                lines += ["", mod._esc(tags_text)]
             lines += [
                 "",
                 "📝 <b>ОСТАВИТЬ ЗАЯВКУ</b>",
@@ -73,6 +73,8 @@ def apply(mod, throttle):
                 "",
                 f'🔎🏡 ПОДОБРАТЬ ДРУГИЕ ВАРИАНТЫ — <a href="{html.escape(search, quote=True)}"><b>НАПИСАТЬ БОТУ</b></a> 🤖',
             ]
+            if tags_text:
+                lines += ["", mod._esc(tags_text)]
             return "\n".join(lines)
 
         text = compose(desc, details, tags)
