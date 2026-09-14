@@ -26,7 +26,8 @@ async def _blocked_parallel_mtproto(update, context, *args, **kwargs):
 
 
 def _env_on(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+    default = "1" if name == "PHUKET_BACKFILL_LATEST_ON_START" else "0"
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def _backfill_latest_once(client, catalog, phuket_mirror, phuket_story):
