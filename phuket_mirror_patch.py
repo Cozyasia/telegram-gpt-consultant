@@ -29,8 +29,7 @@ async def _blocked_parallel_mtproto(update, context, *args, **kwargs):
 
 
 def _env_on(name: str) -> bool:
-    default = "1" if name in {"PHUKET_BACKFILL_LATEST_ON_START", "PHUKET_FORCE_LATEST_ROLLOUT"} else "0"
-    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _force_rewrite_sync(body: str, max_chars: int, phuket_mirror) -> dict:
@@ -123,7 +122,7 @@ async def _force_publish_selected(client, catalog, dest, messages, phuket_mirror
             log.warning("Forced Phuket rollout rewrite attempt=%s failed: %s", attempt + 1, e)
 
     # The permanent live pipeline never uses this fallback. It exists only so
-    # this explicitly requested rollout test can verify media/post/Story transfer
+    # an explicitly requested rollout test can verify media/post/Story transfer
     # without ever publishing altered numbers.
     if data is None:
         log.warning("Forced rollout AI rewrite could not preserve every number; using cleaned source text for this test: %s", last_error)
