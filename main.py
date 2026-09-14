@@ -29,6 +29,18 @@ import manual_edit_guard
 import mtproto_premium
 import fix_big_channel_ctas
 
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+# Explicit runtime bootstrap. sitecustomize remains a safety fallback, but the
+# production entrypoint no longer relies on Python implicitly importing it.
+if _env_enabled("PHUKET_MIRROR_ENABLED"):
+    import phuket_mirror_patch
+
+    phuket_mirror_patch.apply()
+
 catalog_fixes.apply(cozy_catalog)
 catalog_search_patch.apply(cozy_catalog)
 cozy_catalog.search_catalog = lambda spec, limit=5: catalog_dialog.smart_search(cozy_catalog, spec, limit)
