@@ -22,6 +22,7 @@ def apply():
 
     import mtproto_premium
     import phuket_mirror
+    import phuket_story
     from telethon import TelegramClient
 
     original_install = mtproto_premium.install
@@ -43,6 +44,14 @@ def apply():
                 # Never break the existing Samui/Premium daemon if the Phuket
                 # channel is unavailable or permissions are not ready yet.
                 log.exception("Could not attach PhuketMirror; base MTProto daemon continues")
+
+            if phuket_story.ENABLED:
+                try:
+                    await phuket_story.attach(self, _catalog)
+                except Exception:
+                    # Stories are an optional layer. Missing boosts/story admin
+                    # rights must never block normal Phuket channel posts.
+                    log.exception("Could not attach PhuketStories; normal mirror continues")
 
         result = original_run_until_disconnected(self, *args, **kwargs)
         if inspect.isawaitable(result):
