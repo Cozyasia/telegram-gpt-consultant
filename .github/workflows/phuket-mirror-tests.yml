@@ -1,0 +1,21 @@
+name: Phuket mirror tests
+
+on:
+  pull_request:
+    paths:
+      - 'phuket_mirror.py'
+      - 'phuket_mirror_patch.py'
+      - 'sitecustomize.py'
+      - 'tests/**'
+      - 'pytest.ini'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pytest
+      - run: pytest -q
