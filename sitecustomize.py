@@ -24,8 +24,10 @@ try:
 
     if _truthy("PHUKET_MIRROR_ENABLED", "0"):
         from phuket_mirror_patch import apply as _apply_phuket_mirror_patch
+        from phuket_style_patch import apply as _apply_phuket_style_patch
 
         _apply_phuket_mirror_patch()
+        _apply_phuket_style_patch()
 
         async def _mirror_mode_blocked(update, context, *args, **kwargs):
             msg = getattr(update, "effective_message", None)
