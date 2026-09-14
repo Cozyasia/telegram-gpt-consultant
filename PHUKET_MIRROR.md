@@ -29,7 +29,7 @@ When the environment variable is absent or `0`, the previous conservative produc
 
 ## Render environment variables
 
-Required to activate:
+Required to activate normal posts:
 
 - `PHUKET_MIRROR_ENABLED=1`
 - `PHUKET_SOURCE_CHANNEL=thailandsell`
@@ -40,14 +40,19 @@ Optional:
 
 - `PHUKET_MIRROR_MODEL` — defaults to `OPENAI_MODEL`
 - `PHUKET_SOURCE_AUTOJOIN=1` — automatically joins the public source channel with the authorized MTProto account
+- `PHUKET_STORIES_ENABLED=1` — after a successfully mirrored post, also attempts one vertical Telegram Story using the first source photo
 
 The authorized Telegram user must have permission to post in `@phuket_developer`.
 
 ## Stories
 
-Telegram channel Stories require two independent conditions before automation can be enabled:
+Story automation is implemented but disabled by default. For every successful mirrored post it can render a 1080×1920 vertical image from the first source photo, overlay the authorial post title/price/contact and publish it as a 24-hour Telegram Story.
+
+Telegram channel Stories require two independent conditions:
 
 - the authorized user must be an administrator with `post_stories` rights;
 - the channel must have enough boosts. Telegram grants additional story capacity from channel boosts.
 
-The post mirror should be enabled and verified first. Story publishing is intentionally kept as a separate rollout step so missing boosts or Story permissions cannot block normal channel posts.
+Before each Story, the code calls Telegram `stories.canSendStory`. Errors such as `BOOSTS_REQUIRED`, `CHAT_ADMIN_REQUIRED`, `PREMIUM_ACCOUNT_REQUIRED` or `STORIES_TOO_MUCH` are isolated and recorded in the `PhuketStories` worksheet; the normal channel post remains published.
+
+Recommended rollout: verify normal post mirroring first, then set `PHUKET_STORIES_ENABLED=1` after Story rights/boosts are confirmed.
